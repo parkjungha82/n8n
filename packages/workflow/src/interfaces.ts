@@ -4533,7 +4533,6 @@ export interface IUserSettings {
 	instanceAi?: {
 		credentialId?: string | null;
 		modelName?: string;
-		localGatewayDisabled?: boolean;
 	};
 	mcpJsonNudge?: {
 		impressions: number;
