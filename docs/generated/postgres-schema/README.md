@@ -119,6 +119,8 @@ Auto-generated from the PostgreSQL migrations in @n8n/db. Do not edit by hand.
 | [public.promotion_connection](public.promotion_connection.md) | 7 |  | BASE TABLE |
 | [public.promotion_connection_project](public.promotion_connection_project.md) | 4 |  | BASE TABLE |
 | [public.promotion_provider](public.promotion_provider.md) | 8 |  | BASE TABLE |
+| [public.promotion_review](public.promotion_review.md) | 9 |  | BASE TABLE |
+| [public.promotion_run](public.promotion_run.md) | 7 |  | BASE TABLE |
 | [public.role](public.role.md) | 7 |  | BASE TABLE |
 | [public.role_mapping_rule](public.role_mapping_rule.md) | 7 |  | BASE TABLE |
 | [public.role_mapping_rule_project](public.role_mapping_rule_project.md) | 2 |  | BASE TABLE |
@@ -354,6 +356,10 @@ erDiagram
 "public.promotion_connection" }o--|| "public.promotion_provider" : "FOREIGN KEY (#quot;providerId#quot;) REFERENCES promotion_provider(id) ON DELETE RESTRICT"
 "public.promotion_connection_project" |o--|| "public.project" : "FOREIGN KEY (#quot;projectId#quot;) REFERENCES project(id) ON DELETE CASCADE"
 "public.promotion_connection_project" }o--|| "public.promotion_connection" : "FOREIGN KEY (#quot;connectionId#quot;) REFERENCES promotion_connection(id) ON DELETE CASCADE"
+"public.promotion_review" }o--o| "public.user" : "FOREIGN KEY (#quot;approvedById#quot;) REFERENCES #quot;user#quot;(id) ON DELETE SET NULL"
+"public.promotion_review" }o--|| "public.promotion_run" : "FOREIGN KEY (#quot;runId#quot;) REFERENCES promotion_run(id) ON DELETE CASCADE"
+"public.promotion_run" }o--o| "public.user" : "FOREIGN KEY (#quot;createdById#quot;) REFERENCES #quot;user#quot;(id) ON DELETE SET NULL"
+"public.promotion_run" }o--o| "public.promotion_config" : "FOREIGN KEY (#quot;configId#quot;) REFERENCES promotion_config(id) ON DELETE SET NULL"
 "public.role_mapping_rule" }o--|| "public.role" : "FOREIGN KEY (role) REFERENCES role(slug) ON UPDATE CASCADE ON DELETE CASCADE"
 "public.role_mapping_rule_project" }o--|| "public.project" : "FOREIGN KEY (#quot;projectId#quot;) REFERENCES project(id) ON DELETE CASCADE"
 "public.role_mapping_rule_project" }o--|| "public.role_mapping_rule" : "FOREIGN KEY (#quot;roleMappingRuleId#quot;) REFERENCES role_mapping_rule(id) ON DELETE CASCADE"
@@ -1526,6 +1532,26 @@ erDiagram
   varchar_128_ name
   varchar_32_ type
   timestamp_3__with_time_zone updatedAt
+}
+"public.promotion_review" {
+  timestamp_3__with_time_zone approvedAt
+  uuid approvedById FK
+  timestamp_3__with_time_zone closedAt
+  timestamp_3__with_time_zone createdAt
+  varchar_36_ id
+  timestamp_3__with_time_zone mergedAt
+  varchar_255_ remoteReviewId
+  varchar_36_ runId FK
+  varchar_16_ state
+}
+"public.promotion_run" {
+  varchar_255_ branchName
+  varchar_64_ commitSha
+  varchar_36_ configId FK
+  timestamp_3__with_time_zone createdAt
+  uuid createdById FK
+  varchar_16_ direction
+  varchar_36_ id
 }
 "public.role" {
   timestamp_3__with_time_zone createdAt
