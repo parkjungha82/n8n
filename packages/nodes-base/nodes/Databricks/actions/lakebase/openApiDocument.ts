@@ -5,7 +5,7 @@ import { NodeApiError } from 'n8n-workflow';
 export const OPENAPI_PATH = /\/openapi\.json$/;
 
 export const OPENAPI_DISABLED_NOTICE =
-	'Turn on Data API > API > Advanced settings > OpenAPI specification for this Lakebase project, so the node can list its columns.';
+	'Turn on Data API > API > Advanced settings > OpenAPI specification for this Lakebase project.';
 
 export function isOpenApiUnavailable(error: unknown, url: string): boolean {
 	if (!OPENAPI_PATH.test(url)) return false;
