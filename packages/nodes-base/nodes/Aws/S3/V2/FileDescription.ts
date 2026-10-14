@@ -37,6 +37,12 @@ export const fileOperations: INodeProperties[] = [
 				action: 'Get many files',
 			},
 			{
+				name: 'Get Presigned URL',
+				value: 'getPresignedUrl',
+				description: 'Get a presigned URL for a file',
+				action: 'Get a presigned URL for a file',
+			},
+			{
 				name: 'Upload',
 				value: 'upload',
 				description: 'Upload a file',
@@ -835,6 +841,76 @@ export const fileFields: INodeProperties[] = [
 				name: 'folderKey',
 				type: 'string',
 				default: '',
+			},
+		],
+	},
+	/* -------------------------------------------------------------------------- */
+	/*                                file:getPresignedUrl                               */
+	/* -------------------------------------------------------------------------- */
+	{
+		displayName: 'Bucket Name',
+		name: 'bucketName',
+		type: 'string',
+		required: true,
+		default: '',
+		displayOptions: {
+			show: {
+				resource: ['file'],
+				operation: ['getPresignedUrl'],
+			},
+		},
+	},
+	{
+		displayName: 'File Key',
+		name: 'fileKey',
+		type: 'string',
+		required: true,
+		default: '',
+		displayOptions: {
+			show: {
+				resource: ['file'],
+				operation: ['getPresignedUrl'],
+			},
+		},
+	},
+	{
+		displayName: 'URL Expiry Time',
+		description:
+			'The time period (in seconds) for which the presigned URL will be valid. Maximum is 604800 seconds (7 days).',
+		name: 'urlExpiryTime',
+		type: 'number',
+		typeOptions: {
+			minValue: 1,
+			maxValue: 604800,
+		},
+		default: 3600,
+		displayOptions: {
+			show: {
+				resource: ['file'],
+				operation: ['getPresignedUrl'],
+			},
+		},
+	},
+	{
+		displayName: 'Options',
+		name: 'options',
+		type: 'collection',
+		placeholder: 'Add Field',
+		default: {},
+		displayOptions: {
+			show: {
+				resource: ['file'],
+				operation: ['getPresignedUrl'],
+			},
+		},
+		options: [
+			{
+				displayName: 'Omit Content-Disposition Override',
+				name: 'noContentDisposition',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether to omit the Content-Disposition override and let the browser use the object metadata to decide whether to display or download the file',
 			},
 		],
 	},
