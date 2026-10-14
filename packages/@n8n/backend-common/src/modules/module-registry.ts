@@ -85,6 +85,7 @@ export class ModuleRegistry {
 		'agents',
 		'agent-evals',
 		'scim',
+		'type-availability-policies',
 	];
 
 	private readonly activeModules: string[] = [];
