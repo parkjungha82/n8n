@@ -1,10 +1,19 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import {
 	AGENT_SKILL_INSTRUCTIONS_MAX_LENGTH,
 	AGENT_SKILL_REFERENCE_MAX_COUNT,
 } from '@n8n/api-types';
-import { N8nButton, N8nCallout, N8nIcon } from '@n8n/design-system';
+import {
+	N8nButton,
+	N8nCallout,
+	N8nIcon,
+	N8nInputLabel,
+	N8nOption,
+	N8nSelect,
+	N8nTooltip,
+} from '@n8n/design-system';
+import type { IconName } from '@n8n/design-system';
 import { useI18n, type BaseTextKey } from '@n8n/i18n';
 
 import { useUIStore } from '@/app/stores/ui.store';
@@ -18,9 +27,12 @@ import AgentModal from './modals/AgentModal.vue';
 
 const SKILL_FILE = 'SKILL.md';
 
+export type AgentSkillModalScopeOption = { value: string; label: string; icon: IconName };
+
 export type AgentSkillModalData = {
-	projectId: string;
-	agentId: string;
+	/** Set when opened from an agent. Absent when opened from Settings > Context > Skills. */
+	projectId?: string;
+	agentId?: string;
 	skill?: AgentSkill;
 	skillId?: string;
 	/**
@@ -28,7 +40,22 @@ export type AgentSkillModalData = {
 	 * the modal is still open — skill names must be unique per agent.
 	 */
 	existingSkillNames?: string[];
-	onConfirm: (payload: { id?: string; skill: AgentSkill }) => void;
+	/**
+	 * Shows where the skill can be added. On create the user picks one and the value comes
+	 * back in `onConfirm`. Absent in the agent builder, where the agent fixes the scope.
+	 */
+	scopeOptions?: AgentSkillModalScopeOption[];
+	initialScope?: string;
+	/**
+	 * Skills hub only: a default name that no skill in the scope has yet, as new workflows
+	 * get one. Called with the chosen scope value when the user starts a skill by hand.
+	 */
+	getDefaultName?: (scope: string) => Promise<string>;
+	/** Locks the scope field and explains why in a tooltip: a saved skill keeps its scope. */
+	scopeLockedReason?: string;
+	/** Shows the skill without edit controls, for a user who can use but not change it. */
+	readOnly?: boolean;
+	onConfirm: (payload: { id?: string; skill: AgentSkill; scope?: string }) => void;
 	onRemove?: (id: string) => void;
 };
 
@@ -69,6 +96,53 @@ const step = ref<'upload' | 'manual' | 'edit'>(
 	props.data.skill || props.data.skillId ? 'edit' : 'upload',
 );
 const isImporting = ref(false);
+const scope = ref(props.data.initialScope ?? props.data.scopeOptions?.[0]?.value ?? '');
+
+/** The last default name the server gave. A name the user typed is never replaced. */
+const serverDefaultName = ref<string | null>(null);
+/** Save waits for the lookup, so a taken local default cannot fail after the modal closes. */
+const defaultNameLoading = ref(false);
+let latestNameRequest = 0;
+
+async function refreshDefaultName() {
+	if (!props.data.getDefaultName || props.data.skillId) return;
+	const current = skill.value.name;
+	if (current !== getDefaultSkillName() && current !== serverDefaultName.value) return;
+	const request = ++latestNameRequest;
+	const requestedScope = scope.value;
+	defaultNameLoading.value = true;
+	try {
+		const name = await props.data.getDefaultName(requestedScope);
+		// Only the newest answer for the scope still selected counts, and only while the
+		// user has not typed a name of their own.
+		if (request !== latestNameRequest || scope.value !== requestedScope) return;
+		if (skill.value.name !== current) return;
+		serverDefaultName.value = name;
+		skill.value = { ...skill.value, name };
+	} catch {
+		// Keep the local default. The save still refuses a taken name.
+	} finally {
+		if (request === latestNameRequest) defaultNameLoading.value = false;
+	}
+}
+
+function onAddManually() {
+	step.value = 'manual';
+	void refreshDefaultName();
+}
+
+// A new scope can hold other names, so a default name follows the scope.
+watch(scope, () => {
+	if (step.value === 'manual') void refreshDefaultName();
+});
+const showScope = computed(() => !!props.data.scopeOptions?.length);
+const canChangeScope = computed(
+	() => showScope.value && !props.data.scopeLockedReason && !props.data.readOnly,
+);
+const selectedScopeIcon = computed(
+	() => props.data.scopeOptions?.find((option) => option.value === scope.value)?.icon,
+);
+const readOnly = computed(() => props.data.readOnly === true);
 
 const isEditing = computed(() => !!props.data.skillId);
 const canAddReference = computed(
@@ -200,6 +274,8 @@ function onImportSkill(payload: {
 	referenceCount?: number;
 	error?: string;
 }) {
+	// The import event belongs to the agent builder. Settings has no agent to name.
+	if (!props.data.agentId) return;
 	agentTelemetry.trackImportedSkill({
 		agentId: props.data.agentId,
 		...payload,
@@ -211,6 +287,7 @@ function closeModal() {
 }
 
 function onSave() {
+	if (readOnly.value || defaultNameLoading.value) return;
 	submitted.value = true;
 	if (!canSave.value) return;
 
@@ -221,12 +298,16 @@ function onSave() {
 		...(skill.value.references ? { references: skill.value.references } : {}),
 	});
 
-	props.data.onConfirm({ id: props.data.skillId, skill: payload });
+	props.data.onConfirm({
+		id: props.data.skillId,
+		skill: payload,
+		...(canChangeScope.value ? { scope: scope.value } : {}),
+	});
 	closeModal();
 }
 
 function onRemove() {
-	if (!props.data.skillId) return;
+	if (!props.data.skillId || readOnly.value) return;
 	props.data.onRemove?.(props.data.skillId);
 	closeModal();
 }
@@ -239,9 +320,9 @@ function onRemove() {
 		:title-placeholder="i18n.baseText('agents.builder.skills.name.placeholder')"
 		:title-max-length="128"
 		:title-error="visibleNameError"
-		:editable-title="step !== 'upload'"
+		:editable-title="step !== 'upload' && !readOnly"
 		:show-back="step === 'manual'"
-		:show-footer="step !== 'upload'"
+		:show-footer="step !== 'upload' && !readOnly"
 		:busy="isImporting"
 		size="fit"
 		body-flush
@@ -250,6 +331,14 @@ function onRemove() {
 		@update:title="onSkillUpdate({ name: $event })"
 		@back="onBack"
 	>
+		<N8nCallout
+			v-if="readOnly"
+			theme="info"
+			:class="$style.missingContentCallout"
+			data-testid="agent-skill-read-only-callout"
+		>
+			{{ i18n.baseText('settings.context.skills.readOnly') }}
+		</N8nCallout>
 		<N8nCallout
 			v-if="openedWithMissingContent"
 			theme="warning"
@@ -263,7 +352,7 @@ function onRemove() {
 				v-if="step === 'upload'"
 				v-model:busy="isImporting"
 				@uploaded="onSkillUploaded"
-				@add-manually="step = 'manual'"
+				@add-manually="onAddManually"
 				@import:skill="onImportSkill"
 			/>
 			<template v-else>
@@ -271,19 +360,62 @@ function onRemove() {
 					:skill="skill"
 					:selected-path="selectedPath"
 					:add-reference-disabled="!canAddReference"
+					:read-only="readOnly"
 					@add-reference="onAddReference"
 					@remove-reference="onRemoveReference"
 					@select="selectedPath = $event"
 				/>
 				<AgentSkillViewer
 					:skill="skill"
+					:disabled="readOnly"
 					:selected-path="selectedPath"
 					:errors="visibleErrors"
 					:show-validation-warnings="submitted || openedWithMissingContent"
 					@select:path="selectedPath = $event"
 					@update:skill="onSkillUpdate"
 					@update:valid="onValidUpdate"
-				/>
+				>
+					<template v-if="showScope" #skillFileHeader>
+						<N8nInputLabel
+							:label="i18n.baseText('settings.context.skills.modal.scope.label')"
+							:tooltip-text="i18n.baseText('settings.context.skills.modal.scope.tooltip')"
+							size="small"
+							data-testid="agent-skill-scope"
+						>
+							<N8nTooltip
+								:disabled="!props.data.scopeLockedReason"
+								:content="props.data.scopeLockedReason"
+								placement="top"
+							>
+								<!-- A disabled select drops pointer events, so the tooltip needs its own target. -->
+								<div>
+									<N8nSelect
+										v-model="scope"
+										size="large"
+										:disabled="!canChangeScope"
+										:teleported="false"
+										data-testid="agent-skill-scope-select"
+									>
+										<template v-if="selectedScopeIcon" #prefix>
+											<N8nIcon :icon="selectedScopeIcon" />
+										</template>
+										<N8nOption
+											v-for="option in props.data.scopeOptions"
+											:key="option.value"
+											:value="option.value"
+											:label="option.label"
+										>
+											<span :class="$style.scopeOption">
+												<N8nIcon :icon="option.icon" />
+												<span>{{ option.label }}</span>
+											</span>
+										</N8nOption>
+									</N8nSelect>
+								</div>
+							</N8nTooltip>
+						</N8nInputLabel>
+					</template>
+				</AgentSkillViewer>
 			</template>
 		</div>
 
@@ -294,7 +426,12 @@ function onRemove() {
 			</N8nButton>
 		</template>
 		<template #footerActions>
-			<N8nButton variant="solid" data-testid="agent-skill-create-save" @click="onSave">
+			<N8nButton
+				variant="solid"
+				:disabled="defaultNameLoading"
+				data-testid="agent-skill-create-save"
+				@click="onSave"
+			>
 				{{ i18n.baseText('agents.builder.skills.save') }}
 			</N8nButton>
 		</template>
@@ -314,6 +451,12 @@ function onRemove() {
 
 .missingContentCallout {
 	margin: var(--spacing--md) var(--spacing--lg) 0;
+}
+
+.scopeOption {
+	display: flex;
+	align-items: center;
+	gap: var(--spacing--2xs);
 }
 
 @media (max-width: 480px) {

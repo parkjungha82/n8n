@@ -4,12 +4,13 @@ import { createTestingPinia } from '@pinia/testing';
 import { mockedStore } from '@/__tests__/utils';
 import { useUIStore } from '@/app/stores/ui.store';
 import { configure, fireEvent, waitFor } from '@testing-library/vue';
+import userEvent from '@testing-library/user-event';
 import {
 	AGENT_SKILL_INSTRUCTIONS_MAX_LENGTH,
 	AGENT_SKILL_REFERENCE_MAX_COUNT,
 } from '@n8n/api-types';
 
-import AgentSkillModal from '../components/AgentSkillModal.vue';
+import AgentSkillModal, { type AgentSkillModalData } from '../components/AgentSkillModal.vue';
 import type { AgentSkill } from '../types';
 import { AgentModalTestStub } from './utils/AgentModalTestStub';
 
@@ -46,11 +47,17 @@ function renderModal({
 	skill,
 	skillId,
 	existingSkillNames,
+	settings,
 }: {
-	onConfirm?: (payload: { id?: string; skill: AgentSkill }) => void;
+	onConfirm?: (payload: { id?: string; skill: AgentSkill; scope?: string }) => void;
 	skill?: AgentSkill;
 	skillId?: string;
 	existingSkillNames?: string[];
+	/** Opens the modal as Settings > Context > Skills does: no agent, plus these fields. */
+	settings?: Pick<
+		AgentSkillModalData,
+		'readOnly' | 'scopeOptions' | 'initialScope' | 'scopeLockedReason' | 'getDefaultName'
+	>;
 } = {}) {
 	const renderComponent = createComponentRenderer(AgentSkillModal, {
 		global: {
@@ -76,8 +83,7 @@ function renderModal({
 		props: {
 			modalName: MODAL_NAME,
 			data: {
-				projectId: 'p1',
-				agentId: 'a1',
+				...(settings ?? { projectId: 'p1', agentId: 'a1' }),
 				skill,
 				skillId,
 				existingSkillNames,
@@ -86,6 +92,12 @@ function renderModal({
 		},
 	});
 }
+
+const SAVED_SKILL: AgentSkill = {
+	name: 'brand-voice',
+	description: 'Write clear customer-facing copy.',
+	instructions: 'Keep it short.',
+};
 
 describe('AgentSkillModal', () => {
 	let uiStore: ReturnType<typeof mockedStore<typeof useUIStore>>;
@@ -379,6 +391,169 @@ describe('AgentSkillModal', () => {
 			},
 		});
 		expect(uiStore.closeModal).toHaveBeenCalledWith(MODAL_NAME);
+	});
+});
+
+describe('AgentSkillModal from Settings', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		createTestingPinia({ stubActions: false });
+		const uiStore = mockedStore(useUIStore);
+		uiStore.openModal(MODAL_NAME);
+		uiStore.closeModal = vi.fn();
+	});
+
+	it('shows a read-only skill without edit controls', () => {
+		const { getByTestId, queryByTestId } = renderModal({
+			skillId: 's1',
+			skill: SAVED_SKILL,
+			settings: { readOnly: true },
+		});
+
+		expect(getByTestId('agent-skill-read-only-callout')).toHaveTextContent(
+			'settings.context.skills.readOnly',
+		);
+		expect(queryByTestId('agent-modal-title-input')).not.toBeInTheDocument();
+		expect(queryByTestId('agent-skill-create-save')).not.toBeInTheDocument();
+		expect(queryByTestId('agent-skill-add-reference')).not.toBeInTheDocument();
+	});
+
+	it('returns the chosen scope with a new skill', async () => {
+		const onConfirm = vi.fn();
+		const { getByTestId } = renderModal({
+			onConfirm,
+			settings: {
+				scopeOptions: [
+					{ value: 'project:personal-1', label: 'Personal project', icon: 'user' },
+					{ value: 'project:team-1', label: 'Marketing', icon: 'layers' },
+				],
+				initialScope: 'project:team-1',
+			},
+		});
+		await fireEvent.change(getByTestId('agent-skill-skill-md-file-input'), {
+			target: {
+				files: [new File(['---\nname: Research\ndescription: Use it\n---\nBody'], 'SKILL.md')],
+			},
+		});
+		await waitFor(() => expect(getByTestId('agent-skill-viewer')).toBeInTheDocument());
+
+		// Pick the option that is not the initial one, so the test fails if the choice is lost.
+		await userEvent.click(getByTestId('agent-skill-scope-select'));
+		const option = await waitFor(() => {
+			const match = [...document.querySelectorAll('.el-select-dropdown__item')].find((item) =>
+				item.textContent?.includes('Personal project'),
+			);
+			if (!match) throw new Error('Expected the Personal project option');
+			return match;
+		});
+		await userEvent.click(option);
+		await fireEvent.click(getByTestId('agent-skill-create-save'));
+
+		expect(onConfirm).toHaveBeenCalledWith({
+			id: undefined,
+			skill: { name: 'Research', description: 'Use it', instructions: 'Body' },
+			scope: 'project:personal-1',
+		});
+		// Settings has no agent, so the builder's import event is not sent.
+		expect(trackImportedSkill).not.toHaveBeenCalled();
+	});
+
+	it('shows the scope of a saved skill without letting the user change it', () => {
+		const { getByTestId } = renderModal({
+			skillId: 's1',
+			skill: SAVED_SKILL,
+			settings: {
+				scopeOptions: [{ value: 'agent', label: 'FirstClassDarwin only', icon: 'bot' }],
+				initialScope: 'agent',
+				scopeLockedReason: 'You cannot change it.',
+			},
+		});
+
+		expect(getByTestId('agent-skill-scope')).toBeInTheDocument();
+		expect(getByTestId('agent-skill-scope-select').querySelector('input')).toBeDisabled();
+	});
+
+	it('asks the server for a free default name when a skill is started by hand', async () => {
+		const getDefaultName = vi.fn().mockResolvedValue('New skill 3');
+		const { getByTestId } = renderModal({
+			settings: {
+				scopeOptions: [{ value: 'instance', label: 'Global', icon: 'globe' }],
+				initialScope: 'instance',
+				getDefaultName,
+			},
+		});
+
+		await fireEvent.click(getByTestId('agent-skill-add-manually'));
+
+		expect(getDefaultName).toHaveBeenCalledWith('instance');
+		await waitFor(() => expect(getTitleInput(document.body)).toHaveValue('New skill 3'));
+	});
+
+	it('blocks Save until the default name lookup answers', async () => {
+		let answer: (name: string) => void = () => {};
+		const { getByTestId } = renderModal({
+			settings: {
+				scopeOptions: [{ value: 'instance', label: 'Global', icon: 'globe' }],
+				getDefaultName: vi.fn(
+					async () => await new Promise<string>((resolve) => (answer = resolve)),
+				),
+			},
+		});
+
+		await fireEvent.click(getByTestId('agent-skill-add-manually'));
+
+		expect(getByTestId('agent-skill-create-save')).toBeDisabled();
+		answer('New skill 2');
+		await waitFor(() => expect(getByTestId('agent-skill-create-save')).not.toBeDisabled());
+	});
+
+	it('ignores an answer that a newer lookup replaced', async () => {
+		const answers: Array<(name: string) => void> = [];
+		const { getByTestId } = renderModal({
+			settings: {
+				scopeOptions: [{ value: 'instance', label: 'Global', icon: 'globe' }],
+				getDefaultName: vi.fn(
+					async () => await new Promise<string>((resolve) => answers.push(resolve)),
+				),
+			},
+		});
+
+		await fireEvent.click(getByTestId('agent-skill-add-manually'));
+		await fireEvent.click(getByTestId('agent-modal-back'));
+		await fireEvent.click(getByTestId('agent-skill-add-manually'));
+		answers[1]('New skill 3');
+		await waitFor(() => expect(getTitleInput(document.body)).toHaveValue('New skill 3'));
+		answers[0]('New skill 2');
+		await new Promise(process.nextTick);
+
+		expect(getTitleInput(document.body)).toHaveValue('New skill 3');
+	});
+
+	it('keeps the local default name when the server does not answer', async () => {
+		const { getByTestId } = renderModal({
+			settings: {
+				scopeOptions: [{ value: 'instance', label: 'Global', icon: 'globe' }],
+				getDefaultName: vi.fn().mockRejectedValue(new Error('offline')),
+			},
+		});
+
+		await fireEvent.click(getByTestId('agent-skill-add-manually'));
+		await new Promise(process.nextTick);
+
+		expect(getTitleInput(document.body)).toHaveValue('New skill');
+	});
+
+	it('does not ask for a default name when an existing skill is edited', () => {
+		const getDefaultName = vi.fn();
+		renderModal({ skillId: 's1', skill: SAVED_SKILL, settings: { getDefaultName } });
+
+		expect(getDefaultName).not.toHaveBeenCalled();
+	});
+
+	it('keeps the scope field out of the agent builder', () => {
+		const { queryByTestId } = renderModal({ skillId: 's1', skill: SAVED_SKILL });
+
+		expect(queryByTestId('agent-skill-scope')).not.toBeInTheDocument();
 	});
 });
 

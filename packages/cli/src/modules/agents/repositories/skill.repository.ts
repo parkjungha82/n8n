@@ -204,6 +204,40 @@ export class SkillRepository extends BaseRepository<Skill> {
 		);
 	}
 
+	/**
+	 * The name of the latest version of every skill in one target: the same agent, the
+	 * same project (its agent skills not included) or the instance. For the name check.
+	 */
+	async findLatestNamesInTarget(
+		target: SkillTarget,
+		ctx: OperationContext = {},
+	): Promise<Array<{ skillId: string; name: string }>> {
+		const query = this.managerFor(ctx)
+			.createQueryBuilder(SkillVersion, 'version')
+			.innerJoin(Skill, 'skill', 'skill.id = version.skillId')
+			.select(['version.skillId', 'version.name'])
+			.where((qb) => {
+				const highest = qb
+					.subQuery()
+					.select('MAX(later.version)')
+					.from(SkillVersion, 'later')
+					.where('later.skillId = version.skillId')
+					.getQuery();
+				return `version.version = ${highest}`;
+			});
+		if (target.agentId) {
+			query.andWhere('skill.agentId = :agentId', { agentId: target.agentId });
+		} else if (target.projectId) {
+			query
+				.andWhere('skill.projectId = :projectId', { projectId: target.projectId })
+				.andWhere('skill.agentId IS NULL');
+		} else {
+			query.andWhere('skill.projectId IS NULL').andWhere('skill.agentId IS NULL');
+		}
+		const versions = await query.getMany();
+		return versions.map(({ skillId, name }) => ({ skillId, name }));
+	}
+
 	/** Version rows by id, keyed by version id. A pinned ref reads them. */
 	async findVersionsByIds(
 		versionIds: string[],

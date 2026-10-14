@@ -177,6 +177,27 @@ describe('SkillRepository', () => {
 		});
 	});
 
+	describe('findLatestNamesInTarget', () => {
+		it('returns the latest name of each skill in one target only', async () => {
+			const instance = await createSkill({}, content({ name: 'Old name' }));
+			await skills.insertSavedVersion(instance, 2, content({ name: 'New name' }), null);
+			const inProject = await createSkill({ projectId: project.id }, content({ name: 'P' }));
+			const agent = await createAgent('Agent', { projectId: project.id });
+			const ofAgent = await createSkill({ agentId: agent.id }, content({ name: 'A' }));
+
+			expect(await skills.findLatestNamesInTarget({ projectId: null, agentId: null })).toEqual([
+				{ skillId: instance, name: 'New name' },
+			]);
+			// The agent skills of a project are not project skills.
+			expect(
+				await skills.findLatestNamesInTarget({ projectId: project.id, agentId: null }),
+			).toEqual([{ skillId: inProject, name: 'P' }]);
+			expect(await skills.findLatestNamesInTarget({ projectId: null, agentId: agent.id })).toEqual([
+				{ skillId: ofAgent, name: 'A' },
+			]);
+		});
+	});
+
 	describe('findVisiblePage', () => {
 		const firstPage = { skip: 0 };
 		const ids = (page: { skills: Array<{ id: string }> }) => page.skills.map((skill) => skill.id);
