@@ -31,9 +31,10 @@ const mockOutboundHttp = (
 	response: { statusCode: number; body: unknown } = { statusCode: 200, body: {} },
 ) => {
 	const request = vi.fn().mockResolvedValue(response);
-	const requests = vi.fn().mockReturnValue(mock<HttpRequestClient>({ request }));
+	const close = vi.fn();
+	const requests = vi.fn().mockReturnValue(mock<HttpRequestClient>({ request, close }));
 	const outboundHttp = mock<OutboundHttp>({ requests });
-	return { outboundHttp, requests, request };
+	return { outboundHttp, requests, request, close };
 };
 
 /**
@@ -41,7 +42,7 @@ const mockOutboundHttp = (
  * request through the injected facade, returning the captured request options.
  */
 const sendThroughDestination = async (options: MessageEventBusDestinationWebhookOptions) => {
-	const { outboundHttp, requests, request } = mockOutboundHttp();
+	const { outboundHttp, requests, request, close } = mockOutboundHttp();
 
 	const destination = new MessageEventBusDestinationWebhook(mockEventBus, options, outboundHttp);
 	await destination.receiveFromEventBus({
@@ -52,6 +53,7 @@ const sendThroughDestination = async (options: MessageEventBusDestinationWebhook
 	return {
 		destination,
 		requests,
+		close,
 		sentOptions: request.mock.calls[0][0] as IHttpRequestOptions,
 	};
 };
@@ -109,7 +111,10 @@ describe('MessageEventBusDestinationWebhook', () => {
 				url: 'https://example.com/webhook',
 			});
 
-			expect(requests).toHaveBeenCalledWith({ useDefaultSsrfPolicy: 'unsafe' });
+			expect(requests).toHaveBeenCalledWith({
+				useDefaultSsrfPolicy: 'unsafe',
+				connectionPool: expect.objectContaining({ agentOptions: sentOptions.agentOptions }),
+			});
 			expect(sentOptions).toMatchObject({
 				url: 'https://example.com/webhook',
 				method: 'POST',
@@ -250,6 +255,38 @@ describe('MessageEventBusDestinationWebhook', () => {
 		});
 	});
 
+	describe('connection reuse', () => {
+		it('should create one client and reuse it for every event', async () => {
+			const { outboundHttp, requests, request } = mockOutboundHttp();
+			const destination = new MessageEventBusDestinationWebhook(
+				mockEventBus,
+				{ __type: MessageEventBusDestinationTypeNames.webhook, url: 'https://example.com/webhook' },
+				outboundHttp,
+			);
+
+			for (let i = 0; i < 3; i++) {
+				await destination.receiveFromEventBus({
+					msg: createMessage(),
+					confirmCallback: vi.fn(),
+				} as any);
+			}
+
+			expect(request).toHaveBeenCalledTimes(3);
+			expect(requests).toHaveBeenCalledTimes(1);
+		});
+
+		it('should close the client on close', async () => {
+			const { destination, close } = await sendThroughDestination({
+				__type: MessageEventBusDestinationTypeNames.webhook,
+				url: 'https://example.com/webhook',
+			});
+
+			await destination.close();
+
+			expect(close).toHaveBeenCalled();
+		});
+	});
+
 	describe('TLS option mapping', () => {
 		it('should map allowUnauthorizedCerts to skipSslCertificateValidation', async () => {
 			const { sentOptions } = await sendThroughDestination({
@@ -314,6 +351,7 @@ describe('MessageEventBusDestinationWebhook', () => {
 				keepAlive: false,
 				maxSockets: 10,
 				maxFreeSockets: 2,
+				timeout: 5000,
 			});
 		});
 
@@ -325,6 +363,7 @@ describe('MessageEventBusDestinationWebhook', () => {
 			});
 
 			expect(sentOptions.timeout).toBe(1234);
+			expect(sentOptions.agentOptions?.timeout).toBe(1234);
 		});
 	});
 

@@ -1,13 +1,19 @@
+import type { Logger } from '@n8n/backend-common';
+import type { SsrfProtectionConfig } from '@n8n/config';
 import type { AxiosRequestConfig } from 'axios';
 import axios from 'axios';
 import dns from 'node:dns';
 import http from 'node:http';
 import type { LookupFunction } from 'node:net';
+import { mock } from 'vitest-mock-extended';
 
+import type { SsrfProtectionService } from '../../ssrf';
 import { makeSsrfBridge, useCleanProxyEnv } from '../../ssrf/__tests__/mock-ssrf-bridge';
 import { getBeforeRedirectFn, setAxiosAgents } from '../axios/utils';
 import { type LocalServer, startServer } from '../local-server';
+import type { HttpRequestClientOptions } from '../client-options';
 import { buildNodeAgents } from '../node-agents';
+import { OutboundHttp } from '../outbound-http';
 
 // End-to-end parity tests for the outbound transport layer. These spin up real
 // local HTTP servers (a target and a proxy) and drive requests through the
@@ -188,6 +194,50 @@ describe('outbound transport integration', () => {
 				.router.proxyCache;
 			expect(proxyCache.size).toBe(1);
 			expect(proxy.captured.length).toBeGreaterThanOrEqual(2);
+		});
+	});
+
+	describe('connection reuse', () => {
+		let server: LocalServer;
+		const clientPorts = new Set<number>();
+
+		beforeAll(async () => {
+			server = await startServer((req, res) => {
+				clientPorts.add(req.socket.remotePort ?? 0);
+				res.end('ok');
+			});
+		});
+
+		afterAll(async () => {
+			await server.close();
+		});
+
+		beforeEach(() => {
+			clientPorts.clear();
+		});
+
+		const sendThreeRequests = async (options?: HttpRequestClientOptions) => {
+			const client = new OutboundHttp(
+				mock<SsrfProtectionService>(),
+				mock<SsrfProtectionConfig>({ enabled: false }),
+				mock<Logger>(),
+			).requests(options);
+			for (let i = 0; i < 3; i++) {
+				await client.request({ url: `${server.url}/x`, method: 'GET' });
+			}
+			client.close();
+		};
+
+		it('reuses one connection for sequential requests with a connection pool', async () => {
+			await sendThreeRequests({ connectionPool: { agentOptions: { keepAlive: true } } });
+
+			expect(clientPorts.size).toBe(1);
+		});
+
+		it('opens a new connection per request without a connection pool', async () => {
+			await sendThreeRequests();
+
+			expect(clientPorts.size).toBe(3);
 		});
 	});
 
