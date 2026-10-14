@@ -2,15 +2,23 @@ import { Logger } from '@n8n/backend-common';
 import { EventService } from '@n8n/backend-services';
 import { ExecutionRepository } from '@n8n/db';
 import { Service } from '@n8n/di';
-import type { ExecutionStatus, IExecuteResponsePromiseData } from 'n8n-workflow';
+import {
+	OperationalError,
+	type ExecutionStatus,
+	type IExecuteResponsePromiseData,
+} from 'n8n-workflow';
 
 import { ActiveExecutions } from '@/active-executions';
 
 import { JOB_WAIT_RECHECK_INTERVAL_MS } from './constants';
+import { clearJobRecovery, readJobRecovery } from './job-recovery';
 import type { Job, JobFinishedProps, JobId } from './scaling.types';
 
 type PendingJobWait = {
-	jobKey: string;
+	executionId: string;
+	/** The job the caller enqueued and holds. The stall sweep may rebind the wait to a fresh ID. */
+	originalJob: Job;
+	jobId: JobId;
 	resolve: () => void;
 	reject: (error: Error) => void;
 };
@@ -50,17 +58,14 @@ const FAILED_RESPONSE: IExecuteResponsePromiseData = {
  */
 @Service()
 export class JobOutcomeTracker {
-	/** Results the worker reported for jobs this process enqueued, keyed by execution ID. */
-	private readonly results = new Map<string, JobFinishedProps>();
+	/** Results keyed by queue and job ID, so resumed segments stay separate. */
+	private readonly results = new Map<string, { executionId: string; result: JobFinishedProps }>();
 
-	/** Failures the worker reported before this process started waiting, keyed by execution ID. */
-	private readonly failures = new Map<string, Error>();
+	/** Failures reported before this process started waiting, keyed by queue and job ID. */
+	private readonly failures = new Map<string, { executionId: string; error: Error }>();
 
-	/** Waits for jobs to end, keyed by execution ID. */
+	/** Waits keyed by queue and job ID. */
 	private readonly pendingWaits = new Map<string, PendingJobWait>();
-
-	/** Execution ID for each job being waited for, keyed by queue name and job ID. */
-	private readonly executionIdByJobKey = new Map<string, string>();
 
 	/** One timer for all pending waits, running only while there are any. */
 	private recheckTimer?: NodeJS.Timeout;
@@ -86,29 +91,65 @@ export class JobOutcomeTracker {
 	 * the worker sent one. Bull broadcasts the message to every main and webhook
 	 * process, but only the process that enqueued the job ever pops the result.
 	 */
-	recordFinished(executionId: string, result?: JobFinishedProps) {
-		if (result && this.activeExecutions.has(executionId)) {
-			this.results.set(executionId, result);
+	recordFinished(queueName: string, jobId: JobId, executionId: string, result?: JobFinishedProps) {
+		const jobKey = toJobKey(queueName, jobId);
+		if (result && this.acceptsReport(jobKey, executionId)) {
+			this.results.set(this.toOriginalKey(jobKey), { executionId, result });
 		}
 
-		this.settle(executionId, { succeeded: result?.success ?? true });
+		this.settle(jobKey, { succeeded: result?.success ?? true });
 	}
 
 	/** Record a failure the worker reported, or reject the wait for it at once. */
-	recordFailed(executionId: string, error: Error) {
-		const settled = this.settle(executionId, { error, succeeded: false });
+	recordFailed(queueName: string, jobId: JobId, executionId: string, error: Error) {
+		const jobKey = toJobKey(queueName, jobId);
+		const settled = this.settle(jobKey, { error, succeeded: false });
 		if (settled) return;
 
 		// A fast failure can arrive before the enqueuing process starts to wait
-		if (this.activeExecutions.has(executionId)) this.failures.set(executionId, error);
+		if (this.acceptsReport(jobKey, executionId)) {
+			this.failures.set(this.toOriginalKey(jobKey), { executionId, error });
+		}
+	}
+
+	/** The caller pops outcomes by the job it enqueued, so a rebound wait stores them under that key. */
+	private toOriginalKey(jobKey: string) {
+		const wait = this.pendingWaits.get(jobKey);
+		return wait ? toJobKey(wait.originalJob.queue.name, wait.originalJob.id) : jobKey;
+	}
+
+	private acceptsReport(jobKey: string, executionId: string) {
+		if (!this.activeExecutions.has(executionId)) return false;
+		if (this.pendingWaits.has(jobKey)) return true;
+		// Reports from old segments can arrive after waitFor() has cleaned up stale outcomes.
+		// Reject them so they do not remain in memory after the current job ends.
+		return ![...this.pendingWaits.values()].some((wait) => wait.executionId === executionId);
 	}
 
 	/** Settle the wait for a job from a Bull event, which carries only the job ID. */
 	settleByJobKey(queueName: string, jobId: JobId, error?: Error) {
-		const executionId = this.executionIdByJobKey.get(toJobKey(queueName, jobId));
-		if (!executionId) return;
+		this.settle(toJobKey(queueName, jobId), { error, succeeded: !error });
+	}
 
-		this.settle(executionId, { error, succeeded: !error });
+	/** Re-key the wait for a job that the stall sweep returned to the queue under a fresh job ID. */
+	rebind(queueName: string, job: Job) {
+		const found = this.findWait(job.data.executionId);
+		if (found) this.moveWait(found[0], found[1], toJobKey(queueName, job.id), job.id);
+	}
+
+	/** The job ID the wait for this execution is bound to right now, if a wait is pending. */
+	currentJobId(executionId: string): JobId | undefined {
+		return this.findWait(executionId)?.[1].jobId;
+	}
+
+	private findWait(executionId: string) {
+		return [...this.pendingWaits].find(([, wait]) => wait.executionId === executionId);
+	}
+
+	private moveWait(fromKey: string, wait: PendingJobWait, toKey: string, jobId: JobId) {
+		this.pendingWaits.delete(fromKey);
+		wait.jobId = jobId;
+		this.pendingWaits.set(toKey, wait);
 	}
 
 	/**
@@ -117,39 +158,58 @@ export class JobOutcomeTracker {
 	 */
 	async waitFor(job: Job): Promise<void> {
 		const { executionId } = job.data;
+		const jobKey = toJobKey(job.queue.name, job.id);
+
+		// Discard broadcasts from another segment that arrived before this wait.
+		for (const outcomes of [this.results, this.failures]) {
+			for (const [key, outcome] of outcomes) {
+				const isOtherSegment = outcome.executionId === executionId && key !== jobKey;
+				if (isOtherSegment && !this.pendingWaits.has(key)) {
+					outcomes.delete(key);
+				}
+			}
+		}
 
 		// The worker may have reported the outcome before this wait was registered.
-		if (this.results.has(executionId)) return;
+		if (this.results.has(jobKey)) return;
 
-		const earlyFailure = this.failures.get(executionId);
+		const earlyFailure = this.failures.get(jobKey);
 		if (earlyFailure) {
-			this.failures.delete(executionId);
-			throw earlyFailure;
+			this.failures.delete(jobKey);
+			throw earlyFailure.error;
 		}
 
 		await new Promise<void>((resolve, reject) => {
-			const jobKey = toJobKey(job.queue.name, job.id);
-			this.pendingWaits.set(executionId, { jobKey, resolve, reject });
-			this.executionIdByJobKey.set(jobKey, executionId);
+			this.pendingWaits.set(jobKey, {
+				executionId,
+				originalJob: job,
+				jobId: job.id,
+				resolve,
+				reject,
+			});
 			this.startRecheckTimer();
 		});
 	}
 
 	/** Get and remove the result for a finished job. */
-	popResult(executionId: string): JobFinishedProps | undefined {
-		const result = this.results.get(executionId);
-		this.results.delete(executionId);
-		this.failures.delete(executionId);
-		return result;
+	popResult(job: Job): JobFinishedProps | undefined {
+		const jobKey = toJobKey(job.queue.name, job.id);
+		const result = this.results.get(jobKey);
+		this.results.delete(jobKey);
+		this.failures.delete(jobKey);
+		return result?.result;
 	}
 
 	/** Drop the wait without settling it, e.g. when the caller cancelled the execution. */
-	drop(executionId: string) {
-		const wait = this.pendingWaits.get(executionId);
+	drop(job: Job) {
+		return this.dropByJobKey(toJobKey(job.queue.name, job.id));
+	}
+
+	private dropByJobKey(jobKey: string) {
+		const wait = this.pendingWaits.get(jobKey);
 		if (!wait) return undefined;
 
-		this.pendingWaits.delete(executionId);
-		this.executionIdByJobKey.delete(wait.jobKey);
+		this.pendingWaits.delete(jobKey);
 		if (this.pendingWaits.size === 0) this.stopRecheckTimer();
 
 		return wait;
@@ -157,7 +217,7 @@ export class JobOutcomeTracker {
 
 	/** Drop every wait. */
 	clear() {
-		for (const executionId of this.pendingWaits.keys()) this.drop(executionId);
+		for (const jobKey of this.pendingWaits.keys()) this.dropByJobKey(jobKey);
 	}
 
 	/**
@@ -176,20 +236,58 @@ export class JobOutcomeTracker {
 	}
 
 	private async recheckPendingWaits() {
-		const statusById = await this.readStatuses([...this.pendingWaits.keys()]);
+		const waits = [...this.pendingWaits];
+		const executionIds = [...new Set(waits.map(([, wait]) => wait.executionId))];
+		const statusById = await this.readStatuses(executionIds);
 		if (!statusById) return;
 
-		for (const [executionId, status] of statusById) {
-			if (IN_FLIGHT_STATUSES.has(status)) continue;
+		const recoveryRechecks: Array<Promise<void>> = [];
+		for (const [jobKey, wait] of waits) {
+			const { executionId } = wait;
+			const status = statusById.get(executionId);
+			if (!status) continue;
 			// An event may have settled the wait while the DB read was in flight
-			if (!this.pendingWaits.has(executionId)) continue;
+			if (this.pendingWaits.get(jobKey) !== wait) continue;
+			if (IN_FLIGHT_STATUSES.has(status)) {
+				recoveryRechecks.push(this.recheckRecovery(wait));
+				continue;
+			}
 
 			this.logger.warn(
 				`Execution ${executionId} ended without a completion event, resolving the wait from the DB`,
 				{ executionId, status },
 			);
 			this.eventService.emit('job-completion-missed', { status });
-			this.settle(executionId, { succeeded: SUCCEEDED_STATUSES.has(status) });
+			this.settle(jobKey, { succeeded: SUCCEEDED_STATUSES.has(status) });
+		}
+
+		await Promise.all(recoveryRechecks);
+	}
+
+	/** Catch up on a stall-sweep recovery whose `global:stalled` event was missed. */
+	private async recheckRecovery(wait: PendingJobWait) {
+		const { executionId, originalJob } = wait;
+		const boundJobId = wait.jobId;
+		try {
+			const recovery = await readJobRecovery(originalJob);
+			const jobKey = toJobKey(originalJob.queue.name, wait.jobId);
+			// Settled while reading, or a rebind during the read already has a newer ID than the record
+			if (this.pendingWaits.get(jobKey) !== wait || wait.jobId !== boundJobId) return;
+
+			if (recovery.failedReason) {
+				this.settle(jobKey, {
+					error: new OperationalError(recovery.failedReason),
+					succeeded: false,
+				});
+			} else if (recovery.jobId) {
+				const toKey = toJobKey(originalJob.queue.name, recovery.jobId);
+				this.moveWait(jobKey, wait, toKey, recovery.jobId);
+			}
+		} catch (error) {
+			this.logger.warn('Failed to read job recovery, will retry on the next recheck', {
+				executionId,
+				error,
+			});
 		}
 	}
 
@@ -218,15 +316,19 @@ export class JobOutcomeTracker {
 		}
 	}
 
-	/** @returns whether a wait was pending for this execution */
-	private settle(executionId: string, outcome: JobOutcome) {
-		const wait = this.drop(executionId);
+	/** @returns whether a wait was pending for this job */
+	private settle(jobKey: string, outcome: JobOutcome) {
+		const wait = this.dropByJobKey(jobKey);
 		if (!wait) return false;
+
+		void clearJobRecovery(wait.originalJob).catch((error) => {
+			this.logger.warn('Failed to clear job recovery', { executionId: wait.executionId, error });
+		});
 
 		// The request may still wait for a response the worker sent while this process
 		// was disconnected. Resolving twice is a no-op.
 		this.activeExecutions.resolveResponsePromise(
-			executionId,
+			wait.executionId,
 			outcome.succeeded ? {} : FAILED_RESPONSE,
 		);
 

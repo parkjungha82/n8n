@@ -24,7 +24,7 @@ import type { WebhookResponseRelay } from '../webhook-response-relay';
 
 const queue = mock<JobQueue>({
 	name: 'jobs',
-	client: { ping: vi.fn() },
+	client: { ping: vi.fn(), eval: vi.fn().mockResolvedValue(null), del: vi.fn() },
 });
 
 vi.mock('bull', () => ({
@@ -198,6 +198,21 @@ describe('ScalingService', () => {
 				expect(scheduleQueueRecoverySpy).toHaveBeenCalledWith(0);
 			});
 
+			it('should rebind the job wait when the stall sweep returns a job under a fresh id', async () => {
+				await scalingService.setupQueue();
+				const recovered = mock<Job>({ id: 'job-2', data: { executionId: 'exec-1' } });
+				queue.getJob.mockResolvedValue(recovered);
+
+				const onStalled = queue.on.mock.calls.find(
+					([event]) => (event as string) === 'global:stalled',
+				)?.[1] as (jobId: JobId) => void;
+				onStalled('job-2');
+				await vi.waitFor(() => expect(jobOutcomeTracker.rebind).toHaveBeenCalled());
+
+				expect(queue.getJob).toHaveBeenCalledWith('job-2');
+				expect(jobOutcomeTracker.rebind).toHaveBeenCalledWith('jobs', recovered);
+			});
+
 			it('should recheck pending job waits when the Redis connection recovers', async () => {
 				await scalingService.setupQueue();
 				const { RedisClientService } = await import('@n8n/backend-services');
@@ -235,6 +250,23 @@ describe('ScalingService', () => {
 				expect(Bull).toHaveBeenCalledWith(...defaultBullArgs);
 				expect(registerWorkerListenersSpy).toHaveBeenCalled();
 				expect(registerMainOrWebhookListenersSpy).not.toHaveBeenCalled();
+			});
+
+			it('should log each job the stall sweep returned to the queue', async () => {
+				// @ts-expect-error readonly property
+				instanceSettings.instanceType = 'worker';
+
+				await scalingService.setupQueue();
+
+				const onStalled = queue.on.mock.calls.find(
+					([event]) => (event as string) === 'stalled',
+				)?.[1] as (job: Job) => void;
+				onStalled(mock<Job>({ id: 'job-1', data: { executionId: 'exec-1' } }));
+
+				expect(scopedLogger.warn).toHaveBeenCalledWith(
+					'Returned a never-started job to the queue',
+					{ jobId: 'job-1', executionId: 'exec-1' },
+				);
 			});
 		});
 
@@ -964,9 +996,13 @@ describe('ScalingService', () => {
 	});
 
 	describe('stopJob', () => {
+		beforeEach(() => {
+			jobOutcomeTracker.currentJobId.mockReset();
+		});
+
 		it('should stop an active job by sending abort signal only', async () => {
 			await scalingService.setupQueue();
-			const job = mock<Job>({ isActive: vi.fn().mockResolvedValue(true) });
+			const job = mock<Job>({ queue, isActive: vi.fn().mockResolvedValue(true) });
 
 			const result = await scalingService.stopJob(job);
 
@@ -978,7 +1014,7 @@ describe('ScalingService', () => {
 
 		it('should stop an inactive job', async () => {
 			await scalingService.setupQueue();
-			const job = mock<Job>({ isActive: vi.fn().mockResolvedValue(false) });
+			const job = mock<Job>({ queue, isActive: vi.fn().mockResolvedValue(false) });
 
 			const result = await scalingService.stopJob(job);
 
@@ -986,9 +1022,48 @@ describe('ScalingService', () => {
 			expect(result).toBe(true);
 		});
 
+		it('should stop the fresh job when the stall sweep returned the job under a new ID', async () => {
+			await scalingService.setupQueue();
+			const fresh = mock<Job>({ id: 'job-2', isActive: vi.fn().mockResolvedValue(false) });
+			const job = mock<Job>({
+				id: 'job-1',
+				data: { executionId: 'exec-1' },
+				queue,
+			});
+			queue.getJob.mockResolvedValueOnce(fresh);
+			jobOutcomeTracker.currentJobId.mockReturnValueOnce('job-2');
+
+			const result = await scalingService.stopJob(job);
+
+			expect(fresh.remove).toHaveBeenCalled();
+			expect(job.remove).not.toHaveBeenCalled();
+			expect(result).toBe(true);
+		});
+
+		it('should stop the fresh job even when the recovery event was missed', async () => {
+			await scalingService.setupQueue();
+			const fresh = mock<Job>({ id: 'job-3', isActive: vi.fn().mockResolvedValue(false) });
+			const job = mock<Job>({
+				id: 'job-1',
+				data: { executionId: 'exec-1' },
+				queue: {
+					getJob: vi.fn().mockResolvedValue(fresh),
+					client: { eval: vi.fn().mockResolvedValue('job-3') },
+				},
+			});
+			jobOutcomeTracker.currentJobId.mockReturnValueOnce('job-1');
+
+			expect(await scalingService.stopJob(job)).toBe(true);
+
+			expect(job.queue.getJob).toHaveBeenCalledWith('job-3');
+			expect(fresh.remove).toHaveBeenCalled();
+			expect(job.remove).not.toHaveBeenCalled();
+		});
+
 		it('should report failure to stop a job', async () => {
 			await scalingService.setupQueue();
 			const job = mock<Job>({
+				queue,
 				isActive: vi.fn().mockImplementation(() => {
 					throw new UnexpectedError('Something went wrong');
 				}),
@@ -1139,6 +1214,8 @@ describe('ScalingService', () => {
 				});
 
 				expect(jobOutcomeTracker.recordFinished).toHaveBeenCalledWith(
+					'jobs',
+					'job-789',
 					'exec-123',
 					expect.objectContaining({
 						status: 'waiting',
@@ -1158,7 +1235,12 @@ describe('ScalingService', () => {
 					success: true,
 				});
 
-				expect(jobOutcomeTracker.recordFinished).toHaveBeenCalledWith('exec-123', undefined);
+				expect(jobOutcomeTracker.recordFinished).toHaveBeenCalledWith(
+					'jobs',
+					'job-789',
+					'exec-123',
+					undefined,
+				);
 			});
 
 			it('should record a job-failed report as a handled error', () => {
@@ -1171,10 +1253,12 @@ describe('ScalingService', () => {
 				});
 
 				expect(jobOutcomeTracker.recordFailed).toHaveBeenCalledWith(
+					'jobs',
+					'job-789',
 					'exec-123',
 					expect.any(OperationalError),
 				);
-				expect(jobOutcomeTracker.recordFailed.mock.calls[0][1].message).toBe('boom');
+				expect(jobOutcomeTracker.recordFailed.mock.calls[0][3].message).toBe('boom');
 			});
 
 			it('should settle the wait for a job Bull reports as failed, by queue and job ID', () => {
@@ -1231,7 +1315,7 @@ describe('ScalingService', () => {
 				});
 
 				await expect(wait).resolves.toBeUndefined();
-				expect(service.popJobResult('exec-1')).toBeUndefined();
+				expect(service.popJobResult(job)).toBeUndefined();
 			});
 		});
 	});
@@ -1280,7 +1364,7 @@ describe('ScalingService', () => {
 				runningJobs: 1,
 			});
 
-			scalingService.popJobResult('exec-123');
+			scalingService.popJobResult(mock<Job>({ id: 'job-789', queue: { name: 'jobs' } }));
 
 			expect(scalingService.getDiagnosticCounts().jobResults).toBe(0);
 		});

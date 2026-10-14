@@ -21,6 +21,7 @@ import { assertNever } from '@/utils';
 import { JOB_TYPE_NAME } from './constants';
 import { JobOutcomeTracker } from './job-outcome-tracker';
 import { JobProcessor } from './job-processor';
+import { cancelJobRecovery, clearJobRecovery } from './job-recovery';
 import { throwJobBackToQueue } from './job-return';
 import { DEFAULT_QUEUE_NAME, resolveQueueName, resolveWorkerPoolName } from './queue-name';
 import type {
@@ -403,8 +404,8 @@ export class ScalingService {
 	// #region Jobs
 
 	/** Get and remove the result for a completed job. */
-	popJobResult(executionId: string): JobFinishedProps | undefined {
-		return this.jobOutcomeTracker.popResult(executionId);
+	popJobResult(job: Job): JobFinishedProps | undefined {
+		return this.jobOutcomeTracker.popResult(job);
 	}
 
 	/** Wait until the job ends. Rejects with the failure reason, like Bull's `job.finished()`. */
@@ -478,12 +479,23 @@ export class ScalingService {
 	}
 
 	async stopJob(job: Job) {
-		const props = { jobId: job.id, executionId: job.data.executionId };
-
-		// A removed job emits no completion event, and the caller handles the cancellation
-		this.jobOutcomeTracker.drop(job.data.executionId);
+		const { executionId } = job.data;
+		const props = { jobId: job.id, executionId };
+		const originalJob = job;
 
 		try {
+			// Read Redis as well as the tracker, because the recovery event may have been missed
+			const currentJobId =
+				(await cancelJobRecovery(job)) ?? this.jobOutcomeTracker.currentJobId(executionId);
+
+			if (currentJobId !== undefined && currentJobId !== job.id) {
+				job = (await job.queue.getJob(currentJobId)) ?? job;
+				props.jobId = job.id;
+			}
+
+			// A removed job emits no completion event, and the caller handles the cancellation
+			this.jobOutcomeTracker.drop(job);
+
 			if (await job.isActive()) {
 				await job.progress({ kind: 'abort-job' }); // being processed by worker
 				this.logger.debug('Sent abort signal to worker', props);
@@ -491,6 +503,7 @@ export class ScalingService {
 			}
 
 			await job.remove(); // not yet picked up, or waiting for next pickup (stalled)
+			await clearJobRecovery(originalJob);
 			this.logger.debug('Stopped inactive job', props);
 			return true;
 		} catch (error: unknown) {
@@ -551,6 +564,15 @@ export class ScalingService {
 			if (!this.isJobMessage(msg)) return;
 
 			if (msg.kind === 'abort-job') this.jobProcessor.stopJob(jobId);
+		});
+
+		// With maxStalledCount 0 the sweep fails every activated stall, so this event
+		// only ever reports a never-started job that went back to the queue
+		queue.on('stalled', (job: Job) => {
+			this.logger.warn('Returned a never-started job to the queue', {
+				jobId: job.id,
+				executionId: job.data.executionId,
+			});
 		});
 
 		queue.on('error', (error: Error) => {
@@ -620,6 +642,8 @@ export class ScalingService {
 					 * still ends the wait for the job.
 					 */
 					this.jobOutcomeTracker.recordFinished(
+						queue.name,
+						jobId,
 						msg.executionId,
 						msg.version === 2
 							? {
@@ -661,7 +685,12 @@ export class ScalingService {
 					);
 
 					// The worker already reported the underlying error, so this copy is only a handled signal
-					this.jobOutcomeTracker.recordFailed(msg.executionId, new OperationalError(msg.errorMsg));
+					this.jobOutcomeTracker.recordFailed(
+						queue.name,
+						jobId,
+						msg.executionId,
+						new OperationalError(msg.errorMsg),
+					);
 					break;
 				case 'abort-job':
 					break; // only for worker
@@ -687,6 +716,20 @@ export class ScalingService {
 		});
 		queue.on('global:completed', (jobId: JobId) => {
 			this.jobOutcomeTracker.settleByJobKey(queue.name, jobId);
+		});
+		// The stall sweep returns a never-started job to the queue under a fresh job ID
+		queue.on('global:stalled', (jobId: JobId) => {
+			queue
+				.getJob(jobId)
+				.then((job) => {
+					if (job) this.jobOutcomeTracker.rebind(queue.name, job);
+				})
+				.catch((error: Error) => {
+					this.logger.warn('Failed to load a job the stall sweep returned to the queue', {
+						jobId,
+						error,
+					});
+				});
 		});
 
 		if (this.isQueueMetricsEnabled) {
