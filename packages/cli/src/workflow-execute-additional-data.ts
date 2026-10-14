@@ -49,6 +49,8 @@ import {
 	getSubWorkflowOutputPolicy,
 	attachDynamicCredentialsUsage,
 	summarizeDynamicCredentialsUsage,
+	attachSubWorkflowRedaction,
+	summarizeSubWorkflowRedaction,
 } from 'n8n-workflow';
 
 import type { PrepareWorkflowAgentForEval } from './modules/agents/agent-runtime-instrumentation';
@@ -745,18 +747,21 @@ async function startExecution(
 		// The engine mutates `runData.executionData` in place, so a mid-run crash may leave
 		// credential flags on already-executed tasks — ride them on the error like the
 		// regular failure path below.
-		throw attachDynamicCredentialsUsage(
-			objectToError(
-				{
-					...executionError,
-					executionId,
-					workflowId: workflowData.id,
-					stack: executionError?.stack,
-					message: executionError?.message,
-				},
-				workflow,
+		throw attachSubWorkflowRedaction(
+			attachDynamicCredentialsUsage(
+				objectToError(
+					{
+						...executionError,
+						executionId,
+						workflowId: workflowData.id,
+						stack: executionError?.stack,
+						message: executionError?.message,
+					},
+					workflow,
+				),
+				summarizeDynamicCredentialsUsage(runData.executionData),
 			),
-			summarizeDynamicCredentialsUsage(runData.executionData),
+			summarizeSubWorkflowRedaction(runData.executionData, { includeOwn: true }),
 		);
 	}
 
@@ -775,6 +780,8 @@ async function startExecution(
 			waitTill: data.waitTill,
 			// Report private-credential usage to the caller (detached runs return earlier, skipping this).
 			...summarizeDynamicCredentialsUsage(data.data),
+			// The caller keeps a copy of the output above, so it must redact what this run redacts.
+			subWorkflowRedaction: summarizeSubWorkflowRedaction(data.data, { includeOwn: true }),
 		};
 	}
 	activeExecutions.finalizeExecution(executionId, data);
@@ -784,18 +791,21 @@ async function startExecution(
 
 	// A failed child may still have attempted or resolved private credentials before failing;
 	// ride the usage on the error so a continue-on-fail caller still flags its task
-	// (see `BaseExecuteContext.executeWorkflow`).
-	throw attachDynamicCredentialsUsage(
-		objectToError(
-			{
-				...error,
-				executionId,
-				workflowId: workflowData.id,
-				stack: error?.stack,
-			},
-			workflow,
+	// (see `BaseExecuteContext.executeWorkflow`). The redaction channels ride along the same way.
+	throw attachSubWorkflowRedaction(
+		attachDynamicCredentialsUsage(
+			objectToError(
+				{
+					...error,
+					executionId,
+					workflowId: workflowData.id,
+					stack: error?.stack,
+				},
+				workflow,
+			),
+			summarizeDynamicCredentialsUsage(data.data),
 		),
-		summarizeDynamicCredentialsUsage(data.data),
+		summarizeSubWorkflowRedaction(data.data, { includeOwn: true }),
 	);
 }
 
