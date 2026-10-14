@@ -68,3 +68,21 @@ export {
 	API_KEY_PURPOSES,
 	LEGACY_UNBOUND_PURPOSES,
 } from './services/token-purposes';
+
+export {
+	type AiPreferenceProjectRef,
+	type AiPreferenceItem,
+	type AppliedPreference,
+	type ApplicableAiPreferences,
+	type AiPreferenceUpdateRequest,
+	AiPreferenceService,
+	groupAiPreferences,
+	renderAiPreferences,
+	flattenAiPreferences,
+	type AppliedPreferencesInjection,
+	buildAppliedPreferencesPayload,
+	AI_PREFERENCES_REPLACES_EARLIER,
+	AI_PREFERENCES_CLEARED_BLOCK,
+	renderAiPreferencesBlock,
+} from './services/ai-preference.service';
+export { AiPreferenceScopeFullError } from './errors/response-errors/ai-preference-scope-full.error';
