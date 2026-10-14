@@ -1,4 +1,5 @@
 import {
+	AgentEvent,
 	sanitizeToolName as sanitizeMcpToolName,
 	type Agent as RuntimeAgent,
 	type GenerateResult,
@@ -166,6 +167,7 @@ export class EvalAgentExecutionService {
 		// per-tool hints keep the tool mocks coherent), but the message the agent
 		// receives is this input verbatim — how a fixed eval case is executed.
 		caseInput?: string,
+		hooks?: { onProgress?: (calls: InstanceAiEvalAgentToolCallRecord[]) => Promise<void> },
 	): Promise<InstanceAiEvalAgentExecutionResult> {
 		// Workflow-tool sub-executions carry a configureAdditionalData closure
 		// that doesn't survive queue serialization — refuse upfront so tool
@@ -262,6 +264,7 @@ export class EvalAgentExecutionService {
 		});
 
 		const toolLedger: ToolLedger = new Map();
+		let onLedgerChange: ((toolName: string) => void) | undefined;
 		const credentialHelpers: EvalMockedCredentialsHelper[] = [];
 		const recorder = createAgentModelTurnRecorder(
 			createAiProxyFetch(this.outboundHttp),
@@ -320,6 +323,7 @@ export class EvalAgentExecutionService {
 				requestBody: call.args,
 				mockResponse: call.result,
 			});
+			onLedgerChange?.(key);
 		};
 
 		// Fallback web_search mock — always created (sub-agents may enable web
@@ -343,6 +347,7 @@ export class EvalAgentExecutionService {
 					requestBody: args,
 					mockResponse: result,
 				});
+				onLedgerChange?.('web_search');
 			},
 		});
 
@@ -397,6 +402,7 @@ export class EvalAgentExecutionService {
 							mockHandler,
 							toolContext.toolName,
 							toolLedger,
+							() => onLedgerChange?.(toolContext.toolName),
 						);
 					},
 				},
@@ -406,6 +412,70 @@ export class EvalAgentExecutionService {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			return this.errorResult(`Failed to build agent runtime: ${message}`, seed, skippedFeatures);
+		}
+
+		// Event handlers cannot await writes. Serialize snapshots and drain them before
+		// returning, so progress cannot overwrite completion or a later attempt.
+		const progressCalls = new Map<string, InstanceAiEvalAgentToolCallRecord>();
+		let progressWrites = Promise.resolve();
+		let progressClosed = false;
+		const publishProgress = () => {
+			if (progressClosed || !hooks?.onProgress) return;
+			const calls = [...progressCalls.values()].map((call) => ({ ...call }));
+			progressWrites = progressWrites
+				.then(async () => await hooks.onProgress?.(calls))
+				.catch((error: unknown) => {
+					this.logger.warn('[EvalAgentMock] Could not record tool progress', { error });
+				});
+		};
+		if (hooks?.onProgress) {
+			// A send-and-wait tool records its mocked send before the tool ends.
+			// Notify synchronously; the existing queue owns persistence and ordering.
+			onLedgerChange = (toolName) => {
+				if (progressClosed) return;
+				let changed = false;
+				for (const [id, call] of progressCalls) {
+					if (call.tool !== toolName || call.status !== 'running') continue;
+					const interceptedRequests = toolLedger.get(toolName) ?? [];
+					progressCalls.set(id, {
+						...call,
+						mocked: interceptedRequests.length > 0,
+						interceptedRequests: [...interceptedRequests],
+					});
+					changed = true;
+				}
+				if (changed) publishProgress();
+			};
+			agent.on(AgentEvent.ToolExecutionStart, (event) => {
+				if (progressClosed || event.type !== AgentEvent.ToolExecutionStart) return;
+				progressCalls.set(event.toolCallId, {
+					toolCallId: event.toolCallId,
+					tool: event.toolName,
+					kind: toolSummaries.find((tool) => tool.name === event.toolName)?.kind ?? 'other',
+					input: truncateRecordedValue(event.args),
+					status: 'running',
+					mocked: false,
+					interceptedRequests: [],
+				});
+				publishProgress();
+			});
+			agent.on(AgentEvent.ToolExecutionEnd, (event) => {
+				if (progressClosed || event.type !== AgentEvent.ToolExecutionEnd) return;
+				const previous = progressCalls.get(event.toolCallId);
+				const interceptedRequests = toolLedger.get(event.toolName) ?? [];
+				progressCalls.set(event.toolCallId, {
+					...previous,
+					toolCallId: event.toolCallId,
+					tool: event.toolName,
+					kind: previous?.kind ?? 'other',
+					output: truncateRecordedValue(event.result),
+					status: event.isError ? 'error' : 'completed',
+					...(event.isError ? { error: 'tool_execution_failed' } : {}),
+					mocked: interceptedRequests.length > 0,
+					interceptedRequests: [...interceptedRequests],
+				});
+				publishProgress();
+			});
 		}
 
 		const errors: string[] = [];
@@ -479,6 +549,14 @@ export class EvalAgentExecutionService {
 				credentialHelpers,
 			});
 		} finally {
+			onLedgerChange = undefined;
+			for (const [id, call] of progressCalls) {
+				if (call.status === 'running')
+					progressCalls.set(id, { ...call, status: 'error', error: 'execution_stopped' });
+			}
+			if (progressCalls.size > 0) publishProgress();
+			progressClosed = true;
+			await progressWrites;
 			await recorder.flush();
 			try {
 				await agent.close();
@@ -568,6 +646,7 @@ export class EvalAgentExecutionService {
 		mockHandler: EvalLlmMockHandler,
 		toolName: string,
 		ledger: ToolLedger,
+		onRecorded?: () => void,
 	): EvalLlmMockHandler {
 		return async (requestOptions, node) => {
 			const response = await mockHandler(requestOptions, node);
@@ -583,6 +662,7 @@ export class EvalAgentExecutionService {
 				requestBody: requestOptions.body,
 				mockResponse: snapshotLedgerBody(response?.body),
 			});
+			onRecorded?.();
 			this.logger.debug(
 				`[EvalAgentMock] Intercepted ${requestOptions.method ?? 'GET'} ${requestOptions.url} from tool "${toolName}" (${node.type})`,
 			);
