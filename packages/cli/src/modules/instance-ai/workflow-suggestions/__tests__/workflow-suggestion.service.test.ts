@@ -120,6 +120,7 @@ beforeEach(async () => {
 	suggestions.getSuggestion.mockResolvedValue(suggestion);
 	suggestions.createPending.mockResolvedValue(suggestion);
 	workflowRepository.findByIdInContext.mockResolvedValue(workflow);
+	workflowRepository.findForContentUpdate.mockResolvedValue(workflow);
 	sharedWorkflowRepository.getWorkflowOwningProject.mockResolvedValue(
 		mock<Project>({ id: 'project' }),
 	);

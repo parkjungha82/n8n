@@ -14,6 +14,7 @@ import {
 	type StreamRunResult,
 } from '@n8n/instance-ai';
 import { mock } from 'vitest-mock-extended';
+import { createDeferredPromise } from '@n8n/utils/promise/deferred-promise';
 
 import type { AiUsageService } from '@/services/ai-usage.service';
 
@@ -32,6 +33,9 @@ import {
 } from '../self-healing-agent.service';
 import type { SelfHealingExecutionReferenceService } from '../self-healing-execution-reference.service';
 import type { SelfHealingCandidateService } from '../self-healing-candidate.service';
+import { compileCandidateWorkflow, type CandidateWorkflowResult } from '../candidate-workflow';
+
+vi.mock('../candidate-workflow', () => ({ compileCandidateWorkflow: vi.fn() }));
 
 vi.mock('@n8n/instance-ai', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@n8n/instance-ai')>()),
@@ -149,12 +153,13 @@ describe('SelfHealingAgentService', () => {
 			createProxyRunConfig: vi.fn().mockResolvedValue({}),
 			assertCreditsAvailable: vi.fn().mockResolvedValue(undefined),
 			onActivity: vi.fn(),
+			onComplete: vi.fn(),
 			getAbortReason: () => 'shutdown',
 			onFinish: vi.fn(),
 		};
 		suggestions.requireEditor.mockResolvedValue(user);
 		suggestions.requireCurrentBaseline.mockResolvedValue(user);
-		executions.getReference.mockResolvedValue({ status: 'available', id: '123' });
+		executions.validateReference.mockResolvedValue(undefined);
 		models.resolveAgentModelConfig.mockResolvedValue('test/model');
 		adapter.createContext.mockReturnValue(mock<InstanceAiContext>());
 		aiUsage.isParameterValueSharingAllowed.mockResolvedValue(true);
@@ -190,7 +195,7 @@ describe('SelfHealingAgentService', () => {
 		vi.mocked(streamAgentRun).mockImplementation(async () => stream);
 	});
 
-	it('prepares the captured baseline, binds verification, and returns a readable candidate', async () => {
+	it('prepares the captured baseline and binds verification', async () => {
 		vi.mocked(createSelfHealingAgent).mockImplementationOnce(async (factoryOptions) => {
 			await factoryOptions.verifyCandidate({ filePath: validOutput.candidateFilePath });
 			return mock<Awaited<ReturnType<typeof createSelfHealingAgent>>>();
@@ -207,8 +212,8 @@ describe('SelfHealingAgentService', () => {
 			turns: null,
 			durationSeconds: expect.any(Number),
 		});
-		expect(await result.candidate?.read()).toContain('node-id');
-		expect(await result.candidate?.read()).toContain('original value');
+		expect(files.get(`/workspace/${validOutput.candidateFilePath}`)).toContain('node-id');
+		expect(files.get(`/workspace/${validOutput.candidateFilePath}`)).toContain('original value');
 		expect(candidates.verify).toHaveBeenCalledWith(
 			expect.objectContaining({
 				user,
@@ -261,9 +266,110 @@ describe('SelfHealingAgentService', () => {
 
 	it('applies parameter redaction to the captured candidate', async () => {
 		aiUsage.isParameterValueSharingAllowed.mockResolvedValue(false);
+		await service.execute(input, options);
+		expect(files.get(`/workspace/${validOutput.candidateFilePath}`)).not.toContain(
+			'original value',
+		);
+		expect(files.get(`/workspace/${validOutput.candidateFilePath}`)).toContain('node-id');
+	});
+
+	it('waits for accepted output storage with final usage and the original candidate context', async () => {
+		const entered = createDeferredPromise();
+		const persisted = createDeferredPromise();
+		const candidate: CandidateWorkflowResult = {
+			success: true,
+			workflow: baseline.original,
+			warnings: [],
+			credentialResolution: {
+				mockedNodeNames: [],
+				mockedCredentialTypes: [],
+				mockedCredentialsByNode: {},
+				heldForNewCredentialTypes: [],
+				resolvedCredentialsByNode: {},
+			},
+		};
+		vi.mocked(compileCandidateWorkflow).mockResolvedValue(candidate);
+		options.onComplete = vi.fn(async (result) => {
+			expect(result.usage.credits).toBe(0.25);
+			expect(await result.candidate?.compile()).toEqual(candidate);
+			entered.resolve();
+			await persisted.promise;
+		});
+		const pending = service.execute(input, options);
+		await entered.promise;
+		expect(options.onFinish).not.toHaveBeenCalled();
+		expect(compileCandidateWorkflow).toHaveBeenCalledWith(
+			expect.objectContaining({
+				baseline,
+				filePath: validOutput.candidateFilePath,
+				context: expect.objectContaining({ workspace: expect.anything() }),
+			}),
+		);
+		persisted.resolve();
+		await pending;
+		expect(options.onComplete).toHaveBeenCalledTimes(1);
+		expect(options.onFinish).toHaveBeenCalledTimes(1);
+	});
+
+	it('preserves runtime completion when accepted output storage fails', async () => {
+		options.onComplete = vi.fn().mockRejectedValue(new Error('Storage unavailable'));
+		await expect(service.execute(input, options)).rejects.toThrow('Storage unavailable');
+		expect(options.onFinish).toHaveBeenCalledWith(
+			expect.objectContaining({ status: 'completed', finishReason: 'stop', output: validOutput }),
+			'test/model',
+			stream,
+		);
+	});
+
+	it('reports cancellation before acceptance when accounting outlasts the run', async () => {
+		stream.structuredOutput = {
+			outcome: 'could_not_fix',
+			summary: 'The investigation needs follow-up.',
+			report: 'No candidate is ready.',
+		};
+		credits.claimRunUsage.mockImplementationOnce(async () => {
+			controller.abort('service_shutdown');
+			return 0.25;
+		});
+		options.getAbortReason = () => 'service_shutdown';
+		options.onComplete = vi.fn();
+
 		const result = await service.execute(input, options);
-		expect(await result.candidate?.read()).not.toContain('original value');
-		expect(await result.candidate?.read()).toContain('node-id');
+
+		expect(result).toMatchObject({
+			status: 'cancelled',
+			reason: 'service_shutdown',
+			finishReason: 'stop',
+			output: stream.structuredOutput,
+			usage: { credits: 0.25 },
+		});
+		expect(options.onComplete).toHaveBeenCalledExactlyOnceWith(result, controller.signal);
+		expect(options.onFinish).toHaveBeenCalledWith(result, 'test/model', stream);
+	});
+
+	it('keeps cancellation that occurs while accepting output in the run lifecycle', async () => {
+		options.onComplete = vi.fn(async (_result, signal) => {
+			controller.abort(new Error('Run cancelled'));
+			signal.throwIfAborted();
+		});
+		await expect(service.execute(input, options)).rejects.toThrow('Run cancelled');
+		expect(options.onFinish).toHaveBeenCalledWith(
+			expect.objectContaining({ status: 'cancelled', reason: 'shutdown', finishReason: 'stop' }),
+			'test/model',
+			stream,
+		);
+	});
+
+	it('uses the existing execution service', async () => {
+		const context = mock<InstanceAiContext>({
+			executionService: mock<InstanceAiContext['executionService']>(),
+		});
+		const source = context.executionService;
+		adapter.createContext.mockReturnValueOnce(context);
+		await service.execute(input, options);
+		expect(vi.mocked(createSelfHealingAgent).mock.calls[0][0].context.executionService).toBe(
+			source,
+		);
 	});
 
 	it.each([undefined, { outcome: 'fix_ready', summary: 'Missing report' }])(
@@ -280,7 +386,7 @@ describe('SelfHealingAgentService', () => {
 	);
 
 	it.each(['could_not_fix', 'needs_you'])(
-		'omits the reader when %s has no candidate',
+		'omits the candidate when %s has no candidate file',
 		async (outcome) => {
 			const output = {
 				outcome,
@@ -297,7 +403,6 @@ describe('SelfHealingAgentService', () => {
 
 	it('returns the explicit partial candidate from needs_you output', async () => {
 		const filePath = 'self-healing/partial.workflow.ts';
-		files.set(`/workspace/${filePath}`, 'partial source');
 		stream.structuredOutput = {
 			...validOutput,
 			outcome: 'needs_you',
@@ -306,7 +411,8 @@ describe('SelfHealingAgentService', () => {
 		const result = await service.execute(input, options);
 
 		expect(result.candidate?.filePath).toBe(filePath);
-		expect(await result.candidate?.read()).toBe('partial source');
+		await result.candidate?.compile();
+		expect(compileCandidateWorkflow).toHaveBeenCalledWith(expect.objectContaining({ filePath }));
 	});
 
 	it('preserves valid output when accounting throws', async () => {
@@ -328,7 +434,13 @@ describe('SelfHealingAgentService', () => {
 		});
 	});
 
-	it('preserves output and closes both traces when completion reporting fails', async () => {
+	it('uses the observed runtime turn count', async () => {
+		stream.stepCount = 4;
+		const result = await service.execute(input, options);
+		expect(result.usage.turns).toBe(4);
+	});
+
+	it('preserves completion and closes both traces when diagnostics fail', async () => {
 		const tracing = mock<InstanceAiTraceContext>();
 		tracing.withActiveSpan.mockImplementation(async (_span, fn) => await fn());
 		vi.mocked(createInstanceAiTraceContext).mockResolvedValueOnce(tracing);
@@ -405,6 +517,7 @@ describe('SelfHealingAgentService', () => {
 		const context = mock<InstanceAiContext>({
 			workflowService: {
 				get: vi.fn().mockResolvedValue({ name: 'Later edit', versionId: 'v2', nodes: [] }),
+				getVersion: vi.fn().mockResolvedValue({ versionId: 'v1', nodes: [] }),
 			},
 		});
 		adapter.createContext.mockReturnValueOnce(context);
@@ -420,6 +533,13 @@ describe('SelfHealingAgentService', () => {
 		});
 		await expect(context.workflowService.get('another-workflow')).rejects.toThrow('assigned');
 		await expect(context.workflowService.getAsWorkflowJSON('workflow', 'v2')).rejects.toThrow(
+			'baseline',
+		);
+		expect(await context.workflowService.getVersion?.('workflow', 'v1')).toMatchObject({
+			nodes: baseline.original.nodes,
+			connections: baseline.original.connections,
+		});
+		await expect(context.workflowService.getVersion?.('workflow', 'v2')).rejects.toThrow(
 			'baseline',
 		);
 	});
@@ -438,12 +558,12 @@ describe('SelfHealingAgentService', () => {
 		expect(models.resolveAgentModelConfig).not.toHaveBeenCalled();
 	});
 
-	it('rejects lost edit access, baseline changes, and unavailable execution input', async () => {
+	it('rejects lost edit access, baseline changes, and invalid execution input', async () => {
 		suggestions.requireCurrentBaseline.mockRejectedValueOnce(new Error('No edit access'));
 		await expect(service.execute(input, options)).rejects.toThrow('edit access');
 		suggestions.requireCurrentBaseline.mockRejectedValueOnce(new Error('Stale baseline'));
 		await expect(service.execute(input, options)).rejects.toThrow('Stale baseline');
-		executions.getReference.mockResolvedValueOnce({ status: 'unavailable' });
+		executions.validateReference.mockRejectedValueOnce(new Error('Invalid execution input'));
 		await expect(service.execute(input, options)).rejects.toThrow('execution');
 		expect(models.resolveAgentModelConfig).not.toHaveBeenCalled();
 	});

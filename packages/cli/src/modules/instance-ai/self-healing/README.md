@@ -5,11 +5,29 @@ It also provides the result review API.
 
 ## Run an investigation
 
-Call `InstanceAiService.startSelfHealingRun(input)` from backend code.
+Call `SelfHealingInvestigationService.start(input)` from backend code.
 Set `N8N_INSTANCE_AI_SELF_HEALING_ENABLED=true` before startup.
-Supply the acting `user`, captured `WorkflowSuggestionBaseline`, and failed `executionId`.
-The actor must match `baseline.backgroundUserId` and have current workflow read and edit access.
-The baseline project and execution must belong to `baseline.workflowId`.
+Supply `backgroundUserId`, `projectId`, `workflowId`, and the original failed `executionId`.
+The caller supplies the user who enabled self-healing. The producer checks their current access.
+It captures the baseline with `WorkflowSuggestionService.captureBaseline()`.
+The workflow must be fully published. The failure must belong to its current published version.
+Manual and evaluation executions are ineligible.
+Credential and network failures can still need investigation.
+
+The producer checks execution metadata without loading execution data.
+It passes the execution ID to the agent. The agent reads details through the existing execution tools.
+The execution must remain saved and readable. M3 will define how to retain only the triggering
+execution when saving is disabled or pruning runs. Investigation inputs contain no execution payload.
+
+The call returns an investigation ID or an existing pending suggestion ID.
+A workflow can have one unfinished investigation or pending suggestion.
+Repeated starts for the same failed execution return the original investigation, including after completion.
+Automatic triggers and eligibility for a new failure remain the caller's responsibility.
+After the actor loses access, the caller must require explicit re-enablement before starting new work.
+Re-enablement does not change the actor recorded on an existing investigation.
+
+The producer calls `InstanceAiService.startSelfHealingRun()` with its stored thread and run IDs.
+This uses the existing Assistant run lifecycle. It does not create another job runner.
 
 The backend binds `verify_candidate({ filePath, validationOnly? })` to this investigation.
 It checks current access and the captured baseline before it reads and compiles the candidate.
@@ -25,10 +43,10 @@ Research remains subject to the existing policy. A request that needs approval i
 The agent has no save, publish, credential setup, MCP, browser, or delegation tools.
 It does not request user confirmation or start follow-up runs.
 
-The call returns technical `status`, finish information, credit and timing `usage`, and validated `output`
+The runtime returns technical `status`, finish information, `usage`, and validated `output`
 when available. Output has `outcome`, `summary`, `report`, and an optional `candidateFilePath`.
 `fix_ready` requires a candidate path. `could_not_fix` excludes one.
-The result includes a candidate reader only when validated output names a candidate file.
+The result includes a candidate compiler when validated output names a candidate file.
 Unknown usage measurements stay null. The invocation claims measured credits once.
 Callers must not claim those credits again.
 
@@ -43,10 +61,9 @@ The host uses its existing admission limits, run registry, sandbox, tracing, and
 An unexpected suspension stops the invocation.
 A crashed invocation becomes `crash_interrupted`. It cannot resume as ordinary chat.
 Workspace retention follows the existing sandbox lifecycle.
-Read and persist accepted candidate data before workspace cleanup removes it.
+The awaited completion hook persists accepted output before the host releases the run.
 
-AST-1480 owns investigation admission, baseline capture, final candidate compilation,
-acceptance, and atomic completion. This invocation creates no result or suggestion record.
+`SelfHealingInvestigationService` owns admission, final candidate compilation, and acceptance.
 When parameter sharing is disabled, candidate source omits node parameters and verification is unavailable.
 `compileCandidateWorkflow()` reuses the builder compiler, credential resolution, and save preparation.
 It uses the captured baseline for existing IDs, setup values, and layout. It keeps baseline workflow
@@ -79,14 +96,22 @@ No suggestion row is created by verification.
 
 ## Store a result
 
-Prepare optional workflow changes with `WorkflowSuggestionService.prepareSuggestion()`.
-Pass them to `SelfHealingResultService.complete()` with the outcome, report, original execution ID,
-and usage object. Supply credits and timing from the investigation.
-The method validates references and report content before opening its transaction.
-It then checks current editor access and ownership again and saves the result, suggestion,
-and submission activity together. Callers do not prepare results or supply a transaction.
-Investigation admission and completion retries are not implemented yet.
-When added, persist investigation completion inside this method's transaction.
+The runtime validates final output. The producer compiles the named workspace file.
+It stores the accepted output, runtime usage, and compiled graph on the investigation.
+A credit-claim failure leaves unknown credits and does not discard valid output.
+
+`SelfHealingResultService.complete({ investigationId })` prepares the optional suggestion through
+`WorkflowSuggestionService`. It rechecks access and the captured baseline, then saves the result,
+suggestion, submission activity, and investigation completion in one transaction.
+A repeated completion returns the saved result. A failed transaction leaves accepted output for retry.
+Successful completion clears the temporary accepted output.
+Retries use the stored graph and report. They do not need the workspace or another model run.
+Changed baselines and lost access stop completion without creating a result.
+
+Startup and the existing prune task retry accepted output and reconcile interrupted claims.
+Technical status and termination reasons stay in the existing Assistant run events.
+Completion releases the investigation claim. A pending suggestion then prevents new investigations.
+Apply, discard, dismissal, and outdated reconciliation use the existing suggestion lifecycle.
 Call `complete()` only for accepted investigation outcomes. Technical failures without an accepted result stay
 in internal run records and do not create a report or suggestion.
 The investigation instructions must keep sensitive values out of reports, summaries, and
@@ -100,8 +125,7 @@ suggestion explanations and error context. Persistence does not scrub these fiel
 
 The report is one string. Usage contains `credits`, `turns`, and `durationSeconds`.
 The usage object and all three fields are required. Individual measurements can be null when unknown.
-If an investigation spans multiple runtime invocations, the producer combines their usage once
-before saving the result. Persistence stores this snapshot without charging usage.
+The producer uses one runtime invocation. Persistence stores its usage without charging it again.
 Token counts stay in the existing runtime billing path.
 
 Workflow, original-project, background-user, and suggestion deletion cascade to the result.
@@ -153,4 +177,3 @@ do not check investigation enablement or Assistant model availability.
 
 The inbox will provide result listing, pagination, counts, refresh, and seed examples.
 The review UI will provide review screens and chat and editor navigation.
-The investigation producer will admit invocations and submit accepted results.

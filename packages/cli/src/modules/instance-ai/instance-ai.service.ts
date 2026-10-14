@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { AgentEvent, createScopedWorkspace, filterRuntimeSkillSource } from '@n8n/agents';
 import type {
 	AgentDbMessage,
@@ -257,6 +256,7 @@ import { InstanceAiSandboxService, type RuntimeSandboxEntry } from './sandbox';
 import {
 	SelfHealingAgentService,
 	type SelfHealingRunInput,
+	type SelfHealingRunLifecycle,
 	type SelfHealingRunResult,
 } from './self-healing/self-healing-agent.service';
 import { DbIterationLogStorage } from './storage/db-iteration-log-storage';
@@ -1513,14 +1513,17 @@ export class InstanceAiService {
 	}
 
 	/** Run one internal investigation under the normal host lifecycle. */
-	async startSelfHealingRun(input: SelfHealingRunInput): Promise<SelfHealingRunResult> {
+	async startSelfHealingRun(
+		input: SelfHealingRunInput,
+		lifecycle: SelfHealingRunLifecycle,
+	): Promise<SelfHealingRunResult> {
 		this.selfHealingAgent.assertEnabled();
 		this.assertRunAdmissible(input.user);
-
-		const threadId = randomUUID();
+		const { threadId } = lifecycle;
 		this.liveness.clearThreadState(threadId);
 		const { runId, abortController, messageGroupId } = this.runState.startRun({
 			threadId,
+			runId: lifecycle.runId,
 			user: input.user,
 		});
 
@@ -1535,6 +1538,7 @@ export class InstanceAiService {
 				createProxyRunConfig: async () => await this.createProxyRunConfig(input.user),
 				assertCreditsAvailable: async () => await this.assertAssistantCreditsAvailable(input.user),
 				onActivity: () => this.runState.touchActiveRun(threadId),
+				onComplete: lifecycle.onComplete,
 				getAbortReason: () => {
 					if (this.liveness.consumeRunTimeout(runId).timedOut)
 						return INSTANCE_AI_RUN_TIMEOUT_REASON;

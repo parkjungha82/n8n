@@ -9,6 +9,7 @@ import {
 import type { SystemTaskSchedule } from '@n8n/decorators';
 
 import { InstanceAiService } from './instance-ai.service';
+import { SelfHealingInvestigationService } from './self-healing/self-healing-investigation.service';
 import { SelfHealingTemporaryWorkflowService } from './self-healing/self-healing-temporary-workflow.service';
 
 /**
@@ -46,9 +47,12 @@ export class InstanceAiCheckpointPruningTask implements SystemTask {
 		private readonly databaseConfig: DatabaseConfig,
 		private readonly instanceAiService: InstanceAiService,
 		private readonly temporaryWorkflows: SelfHealingTemporaryWorkflowService,
+		private readonly investigations: SelfHealingInvestigationService,
 	) {}
 
 	async run(signal: AbortSignal): Promise<void> {
+		await this.investigations.reconcile(signal);
+		if (signal.aborted) return;
 		await this.instanceAiService.pruneExpiredData(Date.now(), signal);
 
 		await this.temporaryWorkflows.cleanupAbandoned(signal);
