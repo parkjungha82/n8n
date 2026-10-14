@@ -254,15 +254,18 @@ export {
 export {
 	WorkflowPublicDto,
 	CreatedWorkflowPublicDto,
+	RetrievedWorkflowPublicDto,
 	WorkflowListPublicDto,
 	WorkflowPublishPublicDto,
 	workflowPublicSchema,
 	createdWorkflowPublicSchema,
+	retrievedWorkflowPublicSchema,
 	workflowPublishPublicSchema,
 	workflowListItemPublicSchema,
 	sharedWorkflowPublicSchema,
 	activeWorkflowVersionPublicSchema,
 	workflowParentFolderPublicSchema,
+	workflowParentFolderSummaryPublicSchema,
 	DeletedWorkflowPublicDto,
 	UpdatedWorkflowPublicDto,
 } from './workflows/workflow-public.dto';
