@@ -15,7 +15,8 @@ import {
 // to take more than 1 s.
 const SCHEMA_CACHE_RETRY_DELAY_MS = 1_000;
 
-function errorBody(error: unknown): Record<string, unknown> | undefined {
+/** The JSON body of a failed Data API call, which carries the PostgREST or Postgres code */
+export function lakebaseErrorBody(error: unknown): Record<string, unknown> | undefined {
 	return error instanceof NodeApiError && isRecord(error.context.data)
 		? error.context.data
 		: undefined;
@@ -44,7 +45,7 @@ const OPENAPI_SETTING_PATH =
  * carries its description as far as the dropdown.
  */
 export function explainLakebaseSchemaError(error: unknown, openApiMessage: string): never {
-	if (error instanceof NodeApiError && errorBody(error)?.code === 'PGRST205') {
+	if (error instanceof NodeApiError && lakebaseErrorBody(error)?.code === 'PGRST205') {
 		error.message = openApiMessage;
 		error.description = OPENAPI_SETTING_PATH;
 		throw error;
@@ -85,7 +86,7 @@ export async function lakebaseApiRequest(
 				oauth2: { skipRefreshWhileTokenIsFresh: true },
 			});
 		} catch (error) {
-			const body = errorBody(error);
+			const body = lakebaseErrorBody(error);
 			// Core refreshes only on the credential's tokenExpiredStatusCode (403);
 			// Lakebase signals expiry with 400 or 401.
 			if (!refreshed && isExpiredToken(error, body)) {

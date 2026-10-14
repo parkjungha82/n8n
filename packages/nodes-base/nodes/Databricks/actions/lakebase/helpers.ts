@@ -1,8 +1,10 @@
 import { NodeOperationError } from 'n8n-workflow';
-import type { IExecuteFunctions, ILoadOptionsFunctions } from 'n8n-workflow';
+import type { IExecuteFunctions, ILoadOptionsFunctions, ISupplyDataFunctions } from 'n8n-workflow';
 
 import { extractResourceLocatorValue } from '../helpers';
 import { resolveLakebaseRestBase } from '../../transport';
+
+type LocatorContext = IExecuteFunctions | ISupplyDataFunctions;
 
 /**
  * The execute-time resolvers below take an item index, which a dropdown request does
@@ -21,7 +23,7 @@ export function getSelectedLakebaseTarget(context: ILoadOptionsFunctions) {
 }
 
 function readLocator(
-	context: IExecuteFunctions,
+	context: LocatorContext,
 	itemIndex: number,
 	name: string,
 	label: string,
@@ -35,7 +37,7 @@ function readLocator(
 
 /** `https://{host}/api/2.0/workspace/{id}/rest/{database}/{schema}`, the prefix every Data API path shares */
 export async function resolveLakebaseSchemaUrl(
-	context: IExecuteFunctions,
+	context: LocatorContext,
 	itemIndex: number,
 ): Promise<string> {
 	const project = readLocator(context, itemIndex, 'lakebaseProject', 'project');
@@ -47,7 +49,7 @@ export async function resolveLakebaseSchemaUrl(
 }
 
 export async function resolveLakebaseTableUrl(
-	context: IExecuteFunctions,
+	context: LocatorContext,
 	itemIndex: number,
 ): Promise<string> {
 	const table = readLocator(context, itemIndex, 'lakebaseTable', 'table');
