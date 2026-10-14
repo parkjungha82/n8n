@@ -75,6 +75,12 @@ export class InboundAuthCoreModule implements ModuleInterface {
 		Container.set(AuthenticationPipeline, Container.get(InboundAuthPipeline));
 	}
 
+	/** Lets trigger nodes fill their `trustedSource` dropdown through `ILoadOptionsFunctions`. */
+	async context() {
+		const { TrustedSourceDbDirectory } = await import('./trusted-source-directory.service.js');
+		return { trustedSourceDirectory: Container.get(TrustedSourceDbDirectory) };
+	}
+
 	// Ungated: the runner skips a cluster-scoped task on webhook and worker instances itself.
 	async systemTasks() {
 		const { TrustedSourceDiscoveryTask } = await import('./trusted-source-discovery.task.js');
