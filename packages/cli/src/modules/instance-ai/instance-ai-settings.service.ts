@@ -242,6 +242,7 @@ interface PersistedAdminSettings {
 	sandboxImage?: string;
 	sandboxTimeout?: number;
 	modelName?: string | null;
+	memoryModelName?: string | null;
 	searchDisabled?: boolean;
 	n8nSandboxServiceUrl?: string | null;
 	localGatewayDisabled?: boolean;
@@ -294,6 +295,9 @@ export class InstanceAiSettingsService {
 	private permissions: InstanceAiPermissions = { ...DEFAULT_INSTANCE_AI_PERMISSIONS };
 
 	private adminModelName: string | null = null;
+
+	/** Admin-selected model for the Observer and Reflector; `null` uses the main model. */
+	private adminMemoryModelName: string | null = null;
 
 	private searchDisabled = false;
 
@@ -451,7 +455,11 @@ export class InstanceAiSettingsService {
 					? null
 					: credentialSelection.modelCredentialId,
 			modelName: isManaged || this.hasEnvironmentModelName() ? null : credentialSelection.modelName,
+			memoryModelName:
+				isManaged || this.hasEnvironmentMemoryModel() ? null : this.adminMemoryModelName,
 			modelEnvConfigured: modelConnectionEnvConfigured,
+			modelEnvProvider:
+				!isManaged && modelConnectionEnvConfigured && c.model.includes('/') ? modelProvider : null,
 			sandboxEnvConfigured,
 			searchEnvConfigured,
 			searchDisabled: directEnvironmentConfig && searchEnvConfigured ? false : this.searchDisabled,
@@ -464,6 +472,7 @@ export class InstanceAiSettingsService {
 					apiKey: Boolean(c.modelApiKey.trim() || providerModelApiKeyConfigured),
 					baseUrl: Boolean(c.modelUrl.trim()),
 					model: Boolean(process.env.N8N_INSTANCE_AI_MODEL?.trim()),
+					memoryModel: this.hasEnvironmentMemoryModel(),
 				},
 				sandbox: {
 					provider: Boolean(process.env.N8N_INSTANCE_AI_SANDBOX_PROVIDER?.trim()),
@@ -504,6 +513,7 @@ export class InstanceAiSettingsService {
 				update,
 				[
 					'modelName',
+					'memoryModelName',
 					'sandboxProvider',
 					'sandboxEnabled',
 					'n8nSandboxServiceUrl',
@@ -519,7 +529,13 @@ export class InstanceAiSettingsService {
 			);
 			this.rejectManagedFields(
 				update,
-				['modelName', 'sandboxEnabled', 'n8nSandboxServiceUrl', 'searchDisabled'],
+				[
+					'modelName',
+					'memoryModelName',
+					'sandboxEnabled',
+					'n8nSandboxServiceUrl',
+					'searchDisabled',
+				],
 				this.deploymentLabel(),
 			);
 			if (update.daytonaCredentialId !== null) {
@@ -1348,9 +1364,15 @@ export class InstanceAiSettingsService {
 		return this.config.model.trim();
 	}
 
-	/** Model name for the Observer and Reflector memory tasks; empty when unset. */
+	/**
+	 * Model name for the Observer and Reflector memory tasks; empty when unset.
+	 * The env var wins. The admin setting applies only on direct self-hosted,
+	 * where the model calls go to the provider and not through the proxy.
+	 */
 	getConfiguredMemoryModelName(): string {
-		return this.config.memoryModel.trim();
+		const environmentModel = this.config.memoryModel.trim();
+		if (environmentModel) return environmentModel;
+		return this.isDirectSelfManaged() ? (this.adminMemoryModelName ?? '') : '';
 	}
 
 	/** Resolve just the model name (e.g. 'claude-sonnet-4-20250514') for proxy routing. */
@@ -1537,6 +1559,7 @@ export class InstanceAiSettingsService {
 			managedFields.push('modelCredentialId', 'modelConnection');
 		}
 		if (this.hasEnvironmentModelName()) managedFields.push('modelName');
+		if (this.hasEnvironmentMemoryModel()) managedFields.push('memoryModelName');
 		if (this.hasEnvironmentSandboxConnection()) {
 			managedFields.push(
 				'sandboxProvider',
@@ -1651,6 +1674,10 @@ export class InstanceAiSettingsService {
 		return Boolean(process.env.N8N_INSTANCE_AI_MODEL?.trim());
 	}
 
+	private hasEnvironmentMemoryModel(): boolean {
+		return Boolean(this.config.memoryModel.trim());
+	}
+
 	private hasEnvironmentSandboxConnection(): boolean {
 		if (this.environmentSandboxProvider === 'daytona') {
 			return this.aiService.isProxyEnabled() || Boolean(this.config.daytonaApiKey.trim());
@@ -1762,6 +1789,8 @@ export class InstanceAiSettingsService {
 		if (persisted.sandboxImage !== undefined) c.sandboxImage = persisted.sandboxImage;
 		if (persisted.sandboxTimeout !== undefined) c.sandboxTimeout = persisted.sandboxTimeout;
 		if (persisted.modelName !== undefined) this.adminModelName = persisted.modelName;
+		if (persisted.memoryModelName !== undefined)
+			this.adminMemoryModelName = persisted.memoryModelName;
 		if (persisted.searchDisabled !== undefined)
 			this.searchDisabled =
 				this.isDirectSelfManaged() && this.hasEnvironmentSearchConnection()
@@ -1794,6 +1823,7 @@ export class InstanceAiSettingsService {
 			sandboxImage: c.sandboxImage,
 			sandboxTimeout: c.sandboxTimeout,
 			modelName: this.adminModelName,
+			memoryModelName: this.adminMemoryModelName,
 			searchDisabled: this.searchDisabled,
 			n8nSandboxServiceUrl: this.adminN8nSandboxServiceUrl,
 			localGatewayDisabled: c.localGatewayDisabled,
