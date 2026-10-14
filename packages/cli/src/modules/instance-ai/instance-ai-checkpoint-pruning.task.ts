@@ -9,11 +9,12 @@ import {
 import type { SystemTaskSchedule } from '@n8n/decorators';
 
 import { InstanceAiService } from './instance-ai.service';
+import { SelfHealingTemporaryWorkflowService } from './self-healing/self-healing-temporary-workflow.service';
 
 /**
  * Expires stale Instance AI checkpoints, hard-deletes their tombstones past
  * the GC horizon, and drops expired pending confirmations and conversation
- * threads, so suspended-run state does not pile up forever.
+ * threads. Also removes abandoned Assistant verification workflows.
  */
 @SystemTask()
 export class InstanceAiCheckpointPruningTask implements SystemTask {
@@ -44,9 +45,12 @@ export class InstanceAiCheckpointPruningTask implements SystemTask {
 		private readonly instanceAiConfig: InstanceAiConfig,
 		private readonly databaseConfig: DatabaseConfig,
 		private readonly instanceAiService: InstanceAiService,
+		private readonly temporaryWorkflows: SelfHealingTemporaryWorkflowService,
 	) {}
 
 	async run(signal: AbortSignal): Promise<void> {
 		await this.instanceAiService.pruneExpiredData(Date.now(), signal);
+
+		await this.temporaryWorkflows.cleanupAbandoned(signal);
 	}
 }

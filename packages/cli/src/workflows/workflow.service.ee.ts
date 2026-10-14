@@ -245,7 +245,7 @@ export class EnterpriseWorkflowService {
 	/**
 	 * @param restoredNodes the nodes of the history version this update restores, if any.
 	 */
-	async preventTampering<T extends IWorkflowBase>(
+	async preventTampering<T extends Pick<IWorkflowBase, 'nodes'>>(
 		workflow: T,
 		workflowId: string,
 		user: User,
@@ -280,7 +280,7 @@ export class EnterpriseWorkflowService {
 		}
 	}
 
-	validateWorkflowCredentialUsage<T extends IWorkflowBase>(
+	validateWorkflowCredentialUsage<T extends Pick<IWorkflowBase, 'nodes'>>(
 		newWorkflowVersion: T,
 		previousWorkflowVersion: IWorkflowBase,
 		credentialsUserHasAccessTo: Array<{ id: string }>,
@@ -389,7 +389,7 @@ export class EnterpriseWorkflowService {
 	 * Include credentials and sources in nested workflows and agents.
 	 */
 	getNodesWithInaccessibleCreds(
-		workflow: IWorkflowBase,
+		workflow: Pick<IWorkflowBase, 'nodes'>,
 		userCredIds: Iterable<string>,
 		options: CredentialGuardOptions = {},
 	) {

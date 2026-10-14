@@ -4,7 +4,7 @@ import type { WorkflowSuggestionBaseline } from '@n8n/api-types';
 import type { Logger } from '@n8n/backend-common';
 import type { InstanceWriteAccessService } from '@n8n/backend-services';
 import type { GlobalConfig } from '@n8n/config';
-import type { Project, SharedWorkflowRepository, User } from '@n8n/db';
+import type { User } from '@n8n/db';
 import {
 	createInstanceAiTraceContext,
 	createSelfHealingAgent,
@@ -29,9 +29,9 @@ import {
 	SelfHealingAgentService,
 	type SelfHealingRunInput,
 	type SelfHealingRunOptions,
-	type SelfHealingVerifier,
 } from '../self-healing-agent.service';
 import type { SelfHealingExecutionReferenceService } from '../self-healing-execution-reference.service';
+import type { SelfHealingCandidateService } from '../self-healing-candidate.service';
 
 vi.mock('@n8n/instance-ai', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@n8n/instance-ai')>()),
@@ -91,7 +91,6 @@ describe('SelfHealingAgentService', () => {
 	});
 	const logger = mock<Logger>();
 	const suggestions = mock<WorkflowSuggestionService>();
-	const projects = mock<SharedWorkflowRepository>();
 	const executions = mock<SelfHealingExecutionReferenceService>();
 	const memory = mock<TypeORMAgentMemory>();
 	const adapter = mock<InstanceAiAdapterService>();
@@ -101,13 +100,13 @@ describe('SelfHealingAgentService', () => {
 	const aiUsage = mock<AiUsageService>();
 	const credits = mock<InstanceAiCreditService>();
 	const events = mock<InProcessEventBus>();
+	const candidates = mock<SelfHealingCandidateService>();
 	const filesystem = mock<WorkspaceFilesystem>();
 	const workspace = mock<Workspace>({ filesystem });
 	const service = new SelfHealingAgentService(
 		config,
 		logger,
 		suggestions,
-		projects,
 		executions,
 		memory,
 		adapter,
@@ -117,10 +116,10 @@ describe('SelfHealingAgentService', () => {
 		aiUsage,
 		credits,
 		events,
+		candidates,
 	);
 	let controller: AbortController;
 	let options: SelfHealingRunOptions;
-	let verifier: ReturnType<typeof vi.fn<SelfHealingVerifier>>;
 	let files: Map<string, string | Buffer>;
 	let stream: StreamRunResult;
 
@@ -153,9 +152,8 @@ describe('SelfHealingAgentService', () => {
 			getAbortReason: () => 'shutdown',
 			onFinish: vi.fn(),
 		};
-		verifier = vi.fn().mockResolvedValue({ valid: true });
 		suggestions.requireEditor.mockResolvedValue(user);
-		projects.getWorkflowOwningProject.mockResolvedValue(mock<Project>({ id: 'project' }));
+		suggestions.requireCurrentBaseline.mockResolvedValue(user);
 		executions.getReference.mockResolvedValue({ status: 'available', id: '123' });
 		models.resolveAgentModelConfig.mockResolvedValue('test/model');
 		adapter.createContext.mockReturnValue(mock<InstanceAiContext>());
@@ -197,7 +195,7 @@ describe('SelfHealingAgentService', () => {
 			await factoryOptions.verifyCandidate({ filePath: validOutput.candidateFilePath });
 			return mock<Awaited<ReturnType<typeof createSelfHealingAgent>>>();
 		});
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 
 		expect(result).toMatchObject({
 			status: 'completed',
@@ -211,11 +209,11 @@ describe('SelfHealingAgentService', () => {
 		});
 		expect(await result.candidate?.read()).toContain('node-id');
 		expect(await result.candidate?.read()).toContain('original value');
-		expect(verifier).toHaveBeenCalledWith(
+		expect(candidates.verify).toHaveBeenCalledWith(
 			expect.objectContaining({
 				user,
 				baseline,
-				executionId: '123',
+				context: expect.objectContaining({ threadId: options.threadId, runId: options.runId }),
 				abortSignal: controller.signal,
 			}),
 		);
@@ -263,7 +261,7 @@ describe('SelfHealingAgentService', () => {
 
 	it('applies parameter redaction to the captured candidate', async () => {
 		aiUsage.isParameterValueSharingAllowed.mockResolvedValue(false);
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(await result.candidate?.read()).not.toContain('original value');
 		expect(await result.candidate?.read()).toContain('node-id');
 	});
@@ -272,7 +270,7 @@ describe('SelfHealingAgentService', () => {
 		'reports invalid output and still claims measured work',
 		async (output) => {
 			stream.structuredOutput = output;
-			const result = await service.execute(input, verifier, options);
+			const result = await service.execute(input, options);
 			expect(result.output).toBeUndefined();
 			expect(result.candidate).toBeUndefined();
 			expect(result.validationError).toBeTruthy();
@@ -290,7 +288,7 @@ describe('SelfHealingAgentService', () => {
 				report: 'No candidate is ready.',
 			};
 			stream.structuredOutput = output;
-			const result = await service.execute(input, verifier, options);
+			const result = await service.execute(input, options);
 
 			expect(result.output).toEqual(output);
 			expect(result.candidate).toBeUndefined();
@@ -305,7 +303,7 @@ describe('SelfHealingAgentService', () => {
 			outcome: 'needs_you',
 			candidateFilePath: filePath,
 		};
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 
 		expect(result.candidate?.filePath).toBe(filePath);
 		expect(await result.candidate?.read()).toBe('partial source');
@@ -314,7 +312,7 @@ describe('SelfHealingAgentService', () => {
 	it('preserves valid output when accounting throws', async () => {
 		const failure = new Error('Accounting unavailable');
 		credits.claimRunUsage.mockRejectedValueOnce(failure);
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(result.output).toEqual(validOutput);
 		expect(result.usage.credits).toBeNull();
 		expect(credits.claimRunUsage).toHaveBeenCalledTimes(1);
@@ -323,7 +321,7 @@ describe('SelfHealingAgentService', () => {
 	it('keeps credit usage unknown when the claim returns no delta', async () => {
 		stream.usage = undefined;
 		credits.claimRunUsage.mockResolvedValueOnce(undefined);
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(result.usage).toMatchObject({
 			credits: null,
 			turns: null,
@@ -337,7 +335,7 @@ describe('SelfHealingAgentService', () => {
 		vi.mocked(options.onFinish).mockImplementationOnce(() => {
 			throw new Error('Metric unavailable');
 		});
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(result.output).toEqual(validOutput);
 		expect(options.tracing.finalizeRunTracing).toHaveBeenCalledTimes(1);
 		expect(options.tracing.finalizeMessageTraceRoot).toHaveBeenCalledTimes(1);
@@ -347,7 +345,7 @@ describe('SelfHealingAgentService', () => {
 	it('claims usage after cancellation', async () => {
 		stream.status = 'cancelled';
 		stream.finishReason = 'other';
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(result).toMatchObject({
 			status: 'cancelled',
 			reason: 'shutdown',
@@ -365,7 +363,7 @@ describe('SelfHealingAgentService', () => {
 
 	it('retains output and credits when the iteration cap is reached', async () => {
 		stream.finishReason = 'max-iterations';
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(result.finishReason).toBe('max-iterations');
 		expect(result.output).toEqual(validOutput);
 		expect(result.usage.credits).toBe(0.25);
@@ -374,7 +372,7 @@ describe('SelfHealingAgentService', () => {
 	it('reports unexpected suspension without creating a confirmation', async () => {
 		stream.status = 'suspended';
 		stream.structuredOutput = undefined;
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(result).toMatchObject({ status: 'suspended', reason: 'unexpected_suspension' });
 		expect(result.candidate).toBeUndefined();
 		expect(options.onFinish).toHaveBeenCalledWith(
@@ -389,7 +387,7 @@ describe('SelfHealingAgentService', () => {
 			controller.abort();
 			return mock<RuntimeSandboxEntry>({ workspace });
 		});
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(result).toMatchObject({ status: 'cancelled', reason: 'shutdown' });
 		expect(createSelfHealingAgent).not.toHaveBeenCalled();
 		expect(options.sandbox.destroySandbox).toHaveBeenCalledWith('internal-thread', 'actor');
@@ -397,19 +395,38 @@ describe('SelfHealingAgentService', () => {
 
 	it('returns setup errors without inventing an investigation outcome', async () => {
 		models.resolveAgentModelConfig.mockRejectedValueOnce(new Error('Model unavailable'));
-		const result = await service.execute(input, verifier, options);
+		const result = await service.execute(input, options);
 		expect(result.status).toBe('errored');
 		expect(result.output).toBeUndefined();
 		expect(options.onFinish).toHaveBeenCalledTimes(1);
 	});
 
-	it('rejects a disabled gate or missing verifier at admission', () => {
-		config.instanceAi.selfHealingEnabled = false;
-		expect(() => service.assertEnabled(verifier)).toThrow('disabled');
-		config.instanceAi.selfHealingEnabled = true;
-		expect(() => service.assertEnabled(undefined as unknown as SelfHealingVerifier)).toThrow(
-			'verifier',
+	it('reads the captured graph after later workflow changes and rejects other targets', async () => {
+		const context = mock<InstanceAiContext>({
+			workflowService: {
+				get: vi.fn().mockResolvedValue({ name: 'Later edit', versionId: 'v2', nodes: [] }),
+			},
+		});
+		adapter.createContext.mockReturnValueOnce(context);
+		await service.execute(input, options);
+		expect(await context.workflowService.get('workflow')).toMatchObject({
+			name: baseline.original.name,
+			versionId: 'v1',
+			nodes: baseline.original.nodes,
+		});
+		expect(await context.workflowService.getAsWorkflowJSON('workflow')).toMatchObject({
+			name: baseline.original.name,
+			nodes: [expect.objectContaining({ id: 'node-id', parameters: { value: 'original value' } })],
+		});
+		await expect(context.workflowService.get('another-workflow')).rejects.toThrow('assigned');
+		await expect(context.workflowService.getAsWorkflowJSON('workflow', 'v2')).rejects.toThrow(
+			'baseline',
 		);
+	});
+
+	it('rejects a disabled gate at admission', () => {
+		config.instanceAi.selfHealingEnabled = false;
+		expect(() => service.assertEnabled()).toThrow('disabled');
 		expect(models.resolveAgentModelConfig).not.toHaveBeenCalled();
 	});
 
@@ -417,19 +434,17 @@ describe('SelfHealingAgentService', () => {
 		['disabled actor', { ...input, user: mock<User>({ id: 'actor', disabled: true }) }],
 		['mismatched actor', { ...input, user: mock<User>({ id: 'someone-else' }) }],
 	])('rejects %s before model work', async (_label, invalid) => {
-		await expect(service.execute(invalid, verifier, options)).rejects.toThrow();
+		await expect(service.execute(invalid, options)).rejects.toThrow();
 		expect(models.resolveAgentModelConfig).not.toHaveBeenCalled();
 	});
 
-	it('rejects lost edit access, project changes, and unavailable execution input', async () => {
-		suggestions.requireEditor.mockRejectedValueOnce(new Error('No edit access'));
-		await expect(service.execute(input, verifier, options)).rejects.toThrow('edit access');
-		projects.getWorkflowOwningProject.mockResolvedValueOnce(
-			mock<Project>({ id: 'another-project' }),
-		);
-		await expect(service.execute(input, verifier, options)).rejects.toThrow('baseline project');
+	it('rejects lost edit access, baseline changes, and unavailable execution input', async () => {
+		suggestions.requireCurrentBaseline.mockRejectedValueOnce(new Error('No edit access'));
+		await expect(service.execute(input, options)).rejects.toThrow('edit access');
+		suggestions.requireCurrentBaseline.mockRejectedValueOnce(new Error('Stale baseline'));
+		await expect(service.execute(input, options)).rejects.toThrow('Stale baseline');
 		executions.getReference.mockResolvedValueOnce({ status: 'unavailable' });
-		await expect(service.execute(input, verifier, options)).rejects.toThrow('execution');
+		await expect(service.execute(input, options)).rejects.toThrow('execution');
 		expect(models.resolveAgentModelConfig).not.toHaveBeenCalled();
 	});
 });
