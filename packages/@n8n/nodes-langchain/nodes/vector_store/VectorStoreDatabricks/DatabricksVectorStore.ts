@@ -20,6 +20,10 @@ export type DatabricksIndexInfo = {
 	/** DIRECT_ACCESS: keys of schema_json. DELTA_SYNC: columns_to_sync, or the Unity Catalog columns */
 	schemaColumns?: string[];
 	sourceTable?: string;
+	/** Vector search endpoint that serves the index */
+	endpointName?: string;
+	/** STANDARD or STORAGE_OPTIMIZED; undefined when the endpoint GET fails. Gates filters_json */
+	endpointType?: string;
 };
 
 export interface DatabricksVectorStoreConfig {
@@ -123,6 +127,7 @@ export function parseIndexInfo(raw: unknown): DatabricksIndexInfo {
 		embedding,
 		schemaColumns,
 		sourceTable: optionalString(deltaSpec?.source_table),
+		endpointName: optionalString(raw.endpoint_name),
 	};
 }
 
@@ -194,6 +199,19 @@ export class DatabricksVectorStore extends VectorStore {
 				info.schemaColumns = records(isRecord(table) ? table.columns : undefined).flatMap(
 					(column) => (typeof column.name === 'string' ? [column.name] : []),
 				);
+			} else {
+				await response.body?.cancel();
+			}
+		}
+
+		if (info.endpointName) {
+			const response = await fetchFn(
+				`${host}/api/2.0/vector-search/endpoints/${toPathSegment(info.endpointName)}`,
+			);
+			// No read on the endpoint: the type stays unknown and only a filtered query fails
+			if (response.ok) {
+				const endpoint: unknown = await response.json();
+				info.endpointType = optionalString(isRecord(endpoint) ? endpoint.endpoint_type : undefined);
 			} else {
 				await response.body?.cancel();
 			}
@@ -384,13 +402,31 @@ export class DatabricksVectorStore extends VectorStore {
 		body: Record<string, unknown>,
 		filter?: Record<string, unknown>,
 	): Promise<Array<[Document, number]>> {
-		const { primaryKey, name } = this.index;
+		const { primaryKey, name, endpointName, endpointType } = this.index;
 		const columns = [...new Set([primaryKey, this.contentColumn, ...this.metadataColumns])];
 		const effectiveFilter = filter ?? this.defaultFilter;
 		const filtersJson =
 			effectiveFilter && Object.keys(effectiveFilter).length > 0
 				? JSON.stringify(effectiveFilter)
 				: undefined;
+
+		// Databricks accepts filters_json on STANDARD endpoints only; STORAGE_OPTIMIZED takes filter_string.
+		// An unknown type also refuses, so a filter never reaches an endpoint that can ignore it
+		if (filtersJson && endpointType !== 'STANDARD') {
+			const endpoint = sanitizeMessage(endpointName ?? '(unknown)');
+			if (!endpointType) {
+				throw new UserError(
+					`Could not read the type of the endpoint that serves index ${name}. The Metadata Filter works on STANDARD endpoints only. Check that you can read endpoint ${endpoint}`,
+				);
+			}
+			const hint =
+				endpointType === 'STORAGE_OPTIMIZED'
+					? ' A STORAGE_OPTIMIZED endpoint needs a SQL filter string (filter_string), which this node does not support yet.'
+					: '';
+			throw new UserError(
+				`Index ${name} runs on endpoint ${endpoint} of type ${sanitizeMessage(endpointType)}. The Metadata Filter works on STANDARD endpoints only.${hint} See https://docs.databricks.com/aws/en/ai-search/filtering-guide`,
+			);
+		}
 
 		const response = await databricksRequest(
 			this.fetch,
