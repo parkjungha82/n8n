@@ -411,6 +411,10 @@ describe('GlobalConfig', () => {
 					timeoutThreshold: 10_000,
 					username: '',
 					clusterNodes: '',
+					sentinelNodes: '',
+					sentinelMasterName: '',
+					sentinelPassword: '',
+					sentinelTls: false,
 					tls: false,
 					tlsConfig: {
 						serverName: '',
