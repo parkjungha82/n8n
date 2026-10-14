@@ -2,11 +2,20 @@ import { computed, type ComputedRef, type Ref } from 'vue';
 import { useI18n } from '@n8n/i18n';
 import { useRootStore } from '@n8n/stores/useRootStore';
 import { useToast } from '@n8n/composables/useToast';
-import type { AgentConfigValidationIssue } from '@n8n/api-types';
+import { useRBACStore } from '@n8n/stores/rbac.store';
+import { useSettingsStore } from '@n8n/stores/settings.store';
+import {
+	skillNameKey,
+	type AgentConfigValidationIssue,
+	type AgentSkillAvailability,
+	type SkillDetail,
+	type SkillListItem,
+} from '@n8n/api-types';
 import { useUIStore } from '@/app/stores/ui.store';
 import { useNodeTypesStore } from '@/app/stores/nodeTypes.store';
 import { AI_MCP_TOOL_NODE_TYPE } from '@/app/constants/nodeTypes';
-import { createAgentSkill } from './useAgentApi';
+import { createAgentSkill, getHubSkill, updateAgentSkillAvailability } from './useAgentApi';
+import { useAgentProjectBreadcrumb } from './useAgentProjectBreadcrumb';
 import { mcpServerToNode } from './useMcpServerAdapter';
 import {
 	AGENT_TOOLS_MODAL_KEY,
@@ -127,7 +136,14 @@ export function useAgentCapabilitiesActions(deps: UseAgentCapabilitiesActionsDep
 	const rootStore = useRootStore();
 	const uiStore = useUIStore();
 	const nodeTypesStore = useNodeTypesStore();
+	const rbacStore = useRBACStore();
+	const settingsStore = useSettingsStore();
 	const { showError, showMessage } = useToast();
+	const { projectName } = useAgentProjectBreadcrumb(computed(() => projectId.value));
+
+	const hubSkillsEnabled = computed(
+		() => !localSkills && settingsStore.moduleSettings.agents?.skillsHubEnabled === true,
+	);
 
 	function onOpenAddToolModal(mode: ToolPickerMode = 'tools') {
 		// Capture the target at open time: a confirm landing after an agent/node
@@ -327,11 +343,26 @@ export function useAgentCapabilitiesActions(deps: UseAgentCapabilitiesActionsDep
 				skill,
 				skillId: id,
 				existingSkillNames: appliedSkillNames(id),
+				hubSkillsEnabled: hubSkillsEnabled.value,
+				outdated: hubSkillsEnabled.value && (agent.value?.outdatedSkillIds ?? []).includes(id),
+				canCreateInstanceSkills: rbacStore.hasScope('skill:create'),
+				onUseLatestVersion: (skillId: string) => {
+					if (agentId.value !== targetAgentId) return;
+					void useLatestSkillVersion(skillId);
+				},
 				onRemove: (skillId: string) => {
 					if (agentId.value !== targetAgentId) return;
 					onRemoveSkill(skillId);
 				},
-				onConfirm: ({ id: skillId, skill: updatedSkill }: { id?: string; skill: AgentSkill }) => {
+				onConfirm: ({
+					id: skillId,
+					skill: updatedSkill,
+					availableTo,
+				}: {
+					id?: string;
+					skill: AgentSkill;
+					availableTo?: AgentSkillAvailability;
+				}) => {
 					if (!skillId) return;
 					if (agentId.value !== targetAgentId) return;
 					const sanitizedSkill = normalizeAgentSkillForSave(updatedSkill);
@@ -354,6 +385,9 @@ export function useAgentCapabilitiesActions(deps: UseAgentCapabilitiesActionsDep
 						},
 					};
 					scheduleSkillSave({ skillId, skill: sanitizedSkill });
+					if (availableTo && hubSkillsEnabled.value) {
+						void changeSkillAvailability(skillId, availableTo);
+					}
 				},
 			},
 		});
@@ -369,10 +403,8 @@ export function useAgentCapabilitiesActions(deps: UseAgentCapabilitiesActionsDep
 	 * local-skill hosts. The modal validates against `existingSkillNames` before closing
 	 */
 	function hasDuplicateSkillName(name: string, excludeId?: string): boolean {
-		const normalized = name.trim().toLowerCase();
-		return appliedSkillNames(excludeId).some(
-			(existing) => existing.trim().toLowerCase() === normalized,
-		);
+		const key = skillNameKey(name);
+		return appliedSkillNames(excludeId).some((existing) => skillNameKey(existing) === key);
 	}
 
 	function showDuplicateSkillNameError(name: string) {
@@ -429,7 +461,28 @@ export function useAgentCapabilitiesActions(deps: UseAgentCapabilitiesActionsDep
 				projectId: targetProjectId,
 				agentId: targetAgentId,
 				existingSkillNames: appliedSkillNames(),
-				onConfirm: ({ skill }: { id?: string; skill: AgentSkill }) => {
+				hubSkillsEnabled: hubSkillsEnabled.value,
+				getAttachedSkills: () =>
+					appliedSkills.value.map(({ id, skill }) => ({ id, name: skill.name })),
+				projectLabel: projectName.value ?? undefined,
+				canCreateInstanceSkills: rbacStore.hasScope('skill:create'),
+				onRemove: (skillId: string) => {
+					if (!isCurrentTarget()) return;
+					onRemoveSkill(skillId);
+				},
+				onAttach: async (librarySkill: SkillListItem) =>
+					await attachHubSkill(
+						isCurrentTarget,
+						async () => await getHubSkill(rootStore.restApiContext, librarySkill.id),
+					),
+				onConfirm: ({
+					skill,
+					availableTo,
+				}: {
+					id?: string;
+					skill: AgentSkill;
+					availableTo?: AgentSkillAvailability;
+				}) => {
 					if (localSkills) {
 						if (!isCurrentTarget()) return;
 						const sanitizedSkill = normalizeAgentSkillForSave(skill);
@@ -465,6 +518,7 @@ export function useAgentCapabilitiesActions(deps: UseAgentCapabilitiesActionsDep
 								targetProjectId,
 								targetAgentId,
 								sanitizedSkill,
+								hubSkillsEnabled.value ? availableTo : undefined,
 							);
 							skillId = result.id;
 							created = result.skill;
@@ -508,6 +562,80 @@ export function useAgentCapabilitiesActions(deps: UseAgentCapabilitiesActionsDep
 				},
 			},
 		});
+	}
+
+	async function changeSkillAvailability(skillId: string, availableTo: AgentSkillAvailability) {
+		try {
+			await updateAgentSkillAvailability(
+				rootStore.restApiContext,
+				projectId.value,
+				agentId.value,
+				skillId,
+				availableTo,
+			);
+		} catch (error) {
+			showError(error, locale.baseText('agents.builder.skills.availableTo.error'));
+		}
+	}
+
+	async function attachHubSkill(
+		isCurrentTarget: () => boolean,
+		loadSkill: () => Promise<SkillDetail>,
+	) {
+		let hubSkill: SkillDetail;
+		try {
+			hubSkill = await loadSkill();
+		} catch (error) {
+			showError(error, locale.baseText('agents.builder.skills.attach.error'));
+			return;
+		}
+		if (!isCurrentTarget() || !agent.value || !localConfig.value) return;
+		if (hasDuplicateSkillName(hubSkill.skill.name)) {
+			showDuplicateSkillNameError(hubSkill.skill.name);
+			return;
+		}
+		agent.value = {
+			...agent.value,
+			skillHashes: { ...(agent.value.skillHashes ?? {}), [hubSkill.id]: hubSkill.skillHash },
+			skills: { ...(agent.value.skills ?? {}), [hubSkill.id]: hubSkill.skill },
+		};
+		scheduleConfigUpdate({
+			skills: [
+				...(localConfig.value.skills ?? []).filter((ref) => ref.id !== hubSkill.id),
+				{ type: 'skill', id: hubSkill.id },
+			],
+		});
+	}
+
+	async function useLatestSkillVersion(skillId: string) {
+		const targetAgentId = agentId.value;
+		let hubSkill: SkillDetail;
+		try {
+			hubSkill = await getHubSkill(rootStore.restApiContext, skillId);
+		} catch (error) {
+			showError(error, locale.baseText('agents.builder.skills.useLatest.error'));
+			return;
+		}
+		if (agentId.value !== targetAgentId || agent.value?.id !== targetAgentId) return;
+		if (!localConfig.value) return;
+		agent.value = {
+			...agent.value,
+			skills: { ...(agent.value.skills ?? {}), [skillId]: hubSkill.skill },
+			skillHashes: { ...(agent.value.skillHashes ?? {}), [skillId]: hubSkill.skillHash },
+			outdatedSkillIds: (agent.value.outdatedSkillIds ?? []).filter((id) => id !== skillId),
+		};
+		scheduleConfigUpdate({
+			skills: (localConfig.value.skills ?? []).map((ref) =>
+				ref.id === skillId ? { type: 'skill', id: skillId } : ref,
+			),
+		});
+		try {
+			await beforeAgentMutation?.();
+		} catch {
+			return;
+		}
+		if (agentId.value !== targetAgentId) return;
+		onOpenSkillFromList(skillId);
 	}
 
 	function onConnectedTriggersUpdate(triggers: string[]) {
