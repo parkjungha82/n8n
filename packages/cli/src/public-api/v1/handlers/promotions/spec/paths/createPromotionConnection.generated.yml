@@ -4,6 +4,8 @@ tags:
 summary: Create a promotion connection
 description: Creates a connection on an existing provider, with up to one initial configuration for each direction. Only one instance connection can exist.
 x-required-scope: gitConnection:create
+parameters:
+  - $ref: ../../../../shared/spec/parameters/idempotencyKey.yml
 requestBody:
   required: true
   content:
@@ -120,5 +122,7 @@ responses:
     $ref: ../../../../shared/spec/responses/conflict.yml
   '415':
     $ref: ../../../../shared/spec/responses/unsupportedMediaType.yml
+  '422':
+    $ref: ../../../../shared/spec/responses/unprocessableEntity.yml
   '503':
     $ref: ../../../../shared/spec/responses/serviceUnavailable.yml
